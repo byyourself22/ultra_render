@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:v for k,v in d.items\\(\\) if k not in ['layers','assets']}, indent=2\\)\\); print\\('layers count:', len\\(d.get\\('layers',[]\\)\\), 'assets count:', len\\(d.get\\('assets',[]\\)\\)\\); print\\('first layer keys:', list\\(d['layers'][0].keys\\(\\)\\) if d.get\\('layers'\\) else 'none'\\)\")",
+      "Bash(export PATH=\"$PATH:C:/Users/fire/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained\")",
+      "Bash(cargo build:*)",
+      "Bash(mkdir -p \"/c/Users/fire/bin\")",
+      "Bash(cp \"C:/Users/fire/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/dlltool.exe\" \"/c/Users/fire/bin/dlltool.exe\")",
+      "Bash(pacman -Qq mingw-w64-x86_64-binutils)",
+      "Bash(pacman -S --noconfirm mingw-w64-x86_64-binutils)",
+      "Bash(cargo doc:*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/HostX64/x64/lib.exe\" /DEF:/tmp/opengl32.def /OUT:target/opengl32.lib /MACHINE:X64)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/HostX64/x64/lib.exe\" \"/DEF:opengl32.def\" \"/OUT:opengl32.lib\" \"/MACHINE:X64\")",
+      "Bash(xargs grep:*)",
+      "Bash(xargs wc:*)",
+      "Bash(grep -n \"class.*Buffer\\\\|struct.*Resource\" /c/Users/fire/ultra_render/rive-runtime/renderer/include/rive/renderer/*.hpp)",
+      "Bash(grep -r \"struct RenderPath\\\\|class RenderPath\" /c/Users/fire/ultra_render/thorvg/src/common*)",
+      "Bash(python:*)",
+      "Bash(cargo +stable-x86_64-pc-windows-msvc:*)"
+    ]
+  },
+"hooks": {
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "shell": "powershell",
+          "command": "Write-Output 'ok'; exit 0"
+        }
+      ]
+    }
+  ]
+}
+}

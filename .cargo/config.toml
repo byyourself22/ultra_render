@@ -1,0 +1,9 @@
+[build]
+# Use MSVC toolchain (Windows SDK has the needed libs)
+# Requires: LIB="C:/Program Files (x86)/Windows Kits/10/Debuggers/lib/x64;$LIB"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc.exe"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-L", "C:\\Users\\fire\\ultra_render"]

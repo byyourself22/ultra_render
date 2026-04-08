@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/target/
+
+# Build outputs
+/build/
+**/build/
+/dist/
+/out/
+/debug/
+/release/
+/opengl32.def
+/opengl32.exp
+/opengl32.lib
+
+# Local third-party checkouts
+/thorvg/
+/rive-runtime/
