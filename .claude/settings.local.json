@@ -17,21 +17,34 @@
       "Bash(grep -n \"class.*Buffer\\\\|struct.*Resource\" /c/Users/fire/ultra_render/rive-runtime/renderer/include/rive/renderer/*.hpp)",
       "Bash(grep -r \"struct RenderPath\\\\|class RenderPath\" /c/Users/fire/ultra_render/thorvg/src/common*)",
       "Bash(python:*)",
-      "Bash(cargo +stable-x86_64-pc-windows-msvc:*)"
+      "Bash(cargo +stable-x86_64-pc-windows-msvc:*)",
+      "Bash(where dlltool:*)",
+      "Read(//c/Users/fire/bin/**)",
+      "Bash(rustup show:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(taskkill /f /im ultra_render.exe)",
+      "Bash(cmd.exe /c \"taskkill /f /im ultra_render.exe\")",
+      "Bash(RUST_LOG=info timeout 6 target/debug/ultra_render.exe animations/json/gfunny.json)",
+      "Bash(RUST_LOG=debug timeout 4 target/debug/ultra_render.exe animations/json/gfunny.json)",
+      "Bash(RUST_LOG=info timeout 5 target/debug/ultra_render.exe animations/json/gfunny.json)",
+      "Read(//c/Users/fire/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/**)",
+      "Bash(/c/Users/fire/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/dlltool.exe --version)",
+      "Bash(rustup toolchain:*)"
     ]
   },
-"hooks": {
-  "PreToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [
-        {
-          "type": "command",
-          "shell": "powershell",
-          "command": "Write-Output 'ok'; exit 0"
-        }
-      ]
-    }
-  ]
-}
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "Write-Output 'ok'; exit 0",
+            "shell": "powershell"
+          }
+        ]
+      }
+    ]
+  }
 }

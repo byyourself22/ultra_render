@@ -229,8 +229,8 @@ impl Artboard {
         let was_playing = self.player.advance(delta_seconds);
         let frame = self.player.frame;
 
-        // Only mark dirty if frame actually changed
-        if (frame - self.last_frame).abs() > 0.001 {
+        // Only mark dirty if frame actually changed (use tiny epsilon for sub-frame precision)
+        if (frame - self.last_frame).abs() > f32::EPSILON {
             self.last_frame = frame;
             // Mark all nodes with transform dirt
             for node in &mut self.nodes {
@@ -318,6 +318,21 @@ impl Artboard {
         // is a non-precomp node at root level)
         let root_children: Vec<usize> = children[0].clone();
 
+        // Debug: log node info on first draw
+        static DRAW_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DRAW_LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
+            DRAW_LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::info!("Artboard draw: frame={:.1}, {} nodes, root_children={:?}", frame, self.nodes.len(), root_children);
+            for (i, node) in self.nodes.iter().enumerate() {
+                if let Some(ref ld) = node.layer_data {
+                    let eff = effective_frames[i];
+                    let vis = !ld.hidden && eff >= ld.in_point && eff < ld.out_point;
+                    log::info!("  node[{}] '{}' {:?} parent={:?} eff_frame={:.1} in={:.0}..{:.0} hidden={} shapes={} vis={}",
+                        i, node.name, ld.layer_type, node.parent_idx, eff, ld.in_point, ld.out_point, ld.hidden, ld.shapes.len(), vis);
+                }
+            }
+        }
+
         // Collect draws tree-recursively, back-to-front (ThorVG layer ordering)
         let mut cache = Vec::new();
         self.collect_draws_recursive(
@@ -384,15 +399,22 @@ impl Artboard {
                     for mut draw in draws {
                         draw.path = draw.path.transform(&world);
                         draw.paint.apply_opacity(opacity);
-                        // Layer blend mode overrides shape-level blend if non-Normal
                         if layer_blend != BlendMode::Normal {
                             draw.blend_mode = layer_blend;
                         }
                         commands.push(draw);
                     }
+
+                    // Also recurse into child layers that use this shape as parent
+                    // (Lottie parent hierarchy = transform inheritance, not grouping)
+                    let shape_children = &children[idx];
+                    if !shape_children.is_empty() {
+                        self.collect_draws_recursive(
+                            shape_children, children, effective_frames, commands,
+                        );
+                    }
                 }
                 LayerType::Precomp => {
-                    // Recurse into precomp children (respects tree structure)
                     let precomp_children = &children[idx];
                     if !precomp_children.is_empty() {
                         self.collect_draws_recursive(
@@ -400,10 +422,27 @@ impl Artboard {
                         );
                     }
                 }
+                LayerType::Null => {
+                    // Null layers are transform-only; recurse into children
+                    let null_children = &children[idx];
+                    if !null_children.is_empty() {
+                        self.collect_draws_recursive(
+                            null_children, children, effective_frames, commands,
+                        );
+                    }
+                }
                 LayerType::Solid => {
                     // TODO: render solid color rectangle
                 }
-                _ => {}
+                _ => {
+                    // Any other layer type: still recurse children
+                    let other_children = &children[idx];
+                    if !other_children.is_empty() {
+                        self.collect_draws_recursive(
+                            other_children, children, effective_frames, commands,
+                        );
+                    }
+                }
             }
         }
     }
@@ -695,7 +734,6 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lottie::model::*;
     use crate::geometry::math::Vec2D;
 
     fn make_test_composition() -> LottieComposition {
@@ -988,9 +1026,11 @@ mod tests {
     }
 
     #[test]
-    fn test_gradient_sampling() {
+    fn test_draw_sort_key() {
         use crate::renderer::draw::*;
-        // This just verifies the gradient sample function is accessible
-        // (full gradient test needs the draw batcher)
+        // Verify sort key ordering: higher blend mode → higher key
+        let k1 = build_sort_key(BlendMode::Normal, DrawContents::Opaque, 0, DrawType::MidpointFanFill);
+        let k2 = build_sort_key(BlendMode::Multiply, DrawContents::Opaque, 0, DrawType::MidpointFanFill);
+        assert!(k2 > k1);
     }
 }
