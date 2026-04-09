@@ -1,4 +1,4 @@
-use crate::geometry::math::{AABB, Mat2D};
+use crate::geometry::math::AABB;
 use crate::lottie;
 use crate::scene::artboard::Artboard;
 use crate::scene::sprite::Sprite;
@@ -24,8 +24,22 @@ impl UltraCanvas {
     }
 
     /// Load a Lottie animation and add it as a sprite (now uses Artboard)
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn add_animation(&mut self, path: &str) -> Result<u64, String> {
         let comp = lottie::load_animation(path)?;
+        let artboard = Artboard::from_lottie(&comp);
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut sprite = Sprite::new(id, artboard);
+        sprite.play();
+        self.sprites.push(sprite);
+        Ok(id)
+    }
+
+    /// Load a Lottie animation from a JSON string (for web/embedded)
+    pub fn add_animation_from_json(&mut self, json: &str, _name: &str) -> Result<u64, String> {
+        let comp = lottie::parse_lottie(json)?;
         let artboard = Artboard::from_lottie(&comp);
         let id = self.next_id;
         self.next_id += 1;
@@ -81,18 +95,23 @@ impl UltraCanvas {
         visible
     }
 
-    /// Collect all draw commands from all visible sprites
-    pub fn collect_all_draws(&mut self) -> Vec<(Mat2D, Vec<crate::scene::layer::ShapeDrawCommand>)> {
-        let mut result = Vec::new();
+    /// Collect all draw commands from all visible sprites into a flat list.
+    /// Each sprite's world transform is pre-applied to its paths so a single
+    /// render call (identity transform) can draw everything in one frame.
+    pub fn collect_all_draws(&mut self) -> Vec<crate::scene::layer::ShapeDrawCommand> {
+        let mut all = Vec::new();
         for sprite in &mut self.sprites {
             if !sprite.is_in_view(&self.view_bounds) {
                 continue;
             }
-            let transform = sprite.world_transform();
-            let draws = sprite.artboard.draw().to_vec();
-            result.push((transform, draws));
+            let world = sprite.world_transform();
+            for draw in sprite.artboard.draw() {
+                let mut d = draw.clone();
+                d.path = d.path.transform(&world);
+                all.push(d);
+            }
         }
-        result
+        all
     }
 
     /// Resize viewport

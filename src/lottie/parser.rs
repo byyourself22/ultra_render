@@ -879,6 +879,7 @@ fn parse_stroke_join(v: u32) -> StrokeJoin {
 // ─── File loading helpers ────────────────────────────────────
 
 /// Load a Lottie composition from a .json file
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_from_file(path: &str) -> Result<LottieComposition, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path, e))?;
@@ -886,6 +887,7 @@ pub fn load_from_file(path: &str) -> Result<LottieComposition, String> {
 }
 
 /// Load a Lottie composition from a .lottie (ZIP) file
+#[cfg(feature = "native")]
 pub fn load_from_dotlottie(path: &str) -> Result<LottieComposition, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("Failed to open file {}: {}", path, e))?;
@@ -923,10 +925,13 @@ pub fn load_from_dotlottie(path: &str) -> Result<LottieComposition, String> {
 }
 
 /// Load from either .json or .lottie based on extension
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_animation(path: &str) -> Result<LottieComposition, String> {
+    #[cfg(feature = "native")]
     if path.ends_with(".lottie") {
-        load_from_dotlottie(path)
-    } else {
+        return load_from_dotlottie(path);
+    }
+    {
         load_from_file(path)
     }
 }

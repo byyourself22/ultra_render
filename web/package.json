@@ -1,0 +1,17 @@
+{
+  "name": "ultra-render-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build .. --release --target web --no-default-features --features web",
+    "build:wasm:dev": "wasm-pack build .. --dev --target web --no-default-features --features web",
+    "dev": "npm run build:wasm:dev && vite",
+    "build": "npm run build:wasm && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "vite-plugin-wasm": "^3.4.1"
+  }
+}

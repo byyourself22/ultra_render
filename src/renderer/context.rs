@@ -12,6 +12,9 @@ pub struct RenderContext {
     pub surface: Option<Surface<'static>>,
     pub surface_config: Option<SurfaceConfiguration>,
     pub format: TextureFormat,
+    /// True when the surface format is sRGB — shaders must output linear values
+    /// and the GPU will convert linear→sRGB on write. False = output sRGB directly.
+    pub is_srgb: bool,
     pub width: u32,
     pub height: u32,
     pub msaa_texture: Option<Texture>,
@@ -73,6 +76,8 @@ impl RenderContext {
 
         let (msaa_texture, msaa_view) = create_msaa_texture(&device, format, size.width.max(1), size.height.max(1));
 
+        let is_srgb = format.is_srgb();
+
         Self {
             instance,
             adapter,
@@ -81,6 +86,7 @@ impl RenderContext {
             surface: Some(surface),
             surface_config: Some(config),
             format,
+            is_srgb,
             width: size.width,
             height: size.height,
             msaa_texture: Some(msaa_texture),

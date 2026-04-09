@@ -16,7 +16,9 @@ struct FrameUniforms {
     view_proj: mat4x4<f32>,
     resolution: vec2<f32>,
     time: f32,
-    _pad: f32,
+    /// 1 = sRGB surface: GPU auto-converts linear→sRGB on write, so output linear.
+    /// 0 = non-sRGB surface: output sRGB colors directly (no conversion).
+    is_srgb: u32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: FrameUniforms;
@@ -151,9 +153,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = in.color;
     }
 
-    // Convert sRGB input colors to linear space
-    // (the sRGB surface will convert linear → sRGB on write)
-    color = vec4<f32>(srgb_to_linear3(color.rgb), color.a);
+    // sRGB handling:
+    // - sRGB surface (is_srgb=1): GPU auto-converts linear→sRGB on write.
+    //   We must output linear values, so convert sRGB input → linear here.
+    // - non-sRGB surface (is_srgb=0): no auto-conversion. Output sRGB directly
+    //   so colors match reference Lottie players (ThorVG-compatible behavior).
+    if (uniforms.is_srgb != 0u) {
+        color = vec4<f32>(srgb_to_linear3(color.rgb), color.a);
+    }
 
     // Premultiply alpha for correct blending
     color = vec4<f32>(color.rgb * color.a, color.a);

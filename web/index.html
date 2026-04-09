@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UltraRender - Lottie WebGPU</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1e; }
+    canvas { display: block; width: 100%; height: 100vh; }
+
+    #stats {
+      position: fixed;
+      top: 10px; left: 10px;
+      color: #0f0;
+      font: 12px/1.7 monospace;
+      background: rgba(0,0,0,0.78);
+      padding: 8px 12px;
+      border-radius: 6px;
+      pointer-events: none;
+      z-index: 100;
+      min-width: 200px;
+      border: 1px solid rgba(0,255,0,0.2);
+    }
+    #stats .label { color: #888; font-size: 11px; }
+    #stats .value { color: #0f0; font-weight: bold; }
+    #stats .value.yellow { color: #ff0; }
+    #stats .value.cyan   { color: #0ff; }
+    #stats .sep { border-top: 1px solid rgba(255,255,255,0.1); margin: 4px 0; }
+    #stats .row { display: flex; justify-content: space-between; gap: 8px; }
+
+    #controls {
+      position: fixed;
+      bottom: 16px; left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      z-index: 100;
+    }
+    .ctrl-row {
+      display: flex;
+      gap: 6px;
+      background: rgba(0,0,0,0.75);
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .ctrl-row button {
+      background: rgba(255,255,255,0.08);
+      color: #eee;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 4px;
+      padding: 5px 12px;
+      cursor: pointer;
+      font: 12px monospace;
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+    .ctrl-row button:hover  { background: rgba(255,255,255,0.18); }
+    .ctrl-row button:active { background: rgba(255,255,255,0.28); }
+    .ctrl-row button.synced {
+      border-color: #0ff;
+      color: #0ff;
+    }
+    .sprite-count {
+      color: #fff;
+      font: 13px monospace;
+      line-height: 2;
+      padding: 0 6px;
+      min-width: 28px;
+      text-align: center;
+    }
+
+    #no-webgpu {
+      display: none;
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: #fff;
+      font: 18px sans-serif;
+      text-align: center;
+      background: rgba(200,50,50,0.9);
+      padding: 30px;
+      border-radius: 10px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="ultra-canvas"></canvas>
+
+  <div id="stats">
+    <div class="label">UltraRender WebGPU</div>
+    <div class="sep"></div>
+    <div class="row">
+      <span class="label">FPS</span>
+      <span class="value" id="stat-fps">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Draws</span>
+      <span class="value yellow" id="stat-draws">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Sprites</span>
+      <span class="value" id="stat-sprites">—</span>
+    </div>
+    <div class="sep"></div>
+    <div class="row">
+      <span class="label">Anim Hz</span>
+      <span class="value cyan" id="stat-anim-fps">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Frame</span>
+      <span class="value cyan" id="stat-anim-frame">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Mode</span>
+      <span class="value" id="stat-mode">unbatch</span>
+    </div>
+    <div class="sep"></div>
+    <div class="label" id="stat-status">Initializing…</div>
+  </div>
+
+  <div id="controls">
+    <!-- Row 1: sprite count -->
+    <div class="ctrl-row">
+      <button id="btn-less">− 1</button>
+      <span class="sprite-count" id="ctrl-count">1</span>
+      <button id="btn-more">+ 1</button>
+    </div>
+    <!-- Row 2: batch spawn -->
+    <div class="ctrl-row">
+      <button id="btn-batch-10" title="Spawn 10 synced sprites (same frame = 1 draw batch)">+10 Batch</button>
+      <button id="btn-unbatch-10" title="Spawn 10 unsynced sprites (offset frames)">+10 Unbatch</button>
+      <button id="btn-batch-100" title="Spawn 100 synced sprites">+100 Batch</button>
+      <button id="btn-unbatch-100" title="Spawn 100 unsynced sprites">+100 Unbatch</button>
+    </div>
+  </div>
+
+  <div id="no-webgpu">
+    WebGPU is not supported in this browser.<br>
+    Try Chrome 113+ or Edge 113+.
+  </div>
+
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>

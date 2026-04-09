@@ -8,9 +8,10 @@ use super::buffers::{GpuBuffers, FrameUniforms, ortho_projection};
 /// Main render canvas — orchestrates GPU tessellation + rendering.
 ///
 /// Pipeline:
-///   1. CPU: encode_paths() packs cubic segments + indices + paints
-///   2. GPU compute: tessellate cubics → vertex buffer (De Casteljau)
-///   3. GPU draw: render vertices with paint storage (gradients) + MSAA
+///   1. CPU fills:   lyon tessellate → vertex buffer[0..fill_count]
+///   2. CPU strokes: encode cubic segments
+///   3. GPU compute: tessellate stroke cubics → vertex_buffer[fill_count..]
+///   4. GPU draw:    render all vertices (MSAA)
 pub struct RenderCanvas {
     pub path_pipeline: RenderPipeline,
     pub tessellate_pipeline: ComputePipeline,
@@ -19,6 +20,7 @@ pub struct RenderCanvas {
     pub paint_bind_group_layout: BindGroupLayout,
     pub tessellate_bind_group_layout: BindGroupLayout,
     pub clear_color: wgpu::Color,
+    needs_tessellation: bool,
 }
 
 impl RenderCanvas {
@@ -37,16 +39,15 @@ impl RenderCanvas {
             uniform_bind_group_layout,
             paint_bind_group_layout,
             tessellate_bind_group_layout,
-            clear_color: wgpu::Color {
-                r: 0.1,
-                g: 0.1,
-                b: 0.12,
-                a: 1.0,
-            },
+            clear_color: wgpu::Color { r: 0.1, g: 0.1, b: 0.12, a: 1.0 },
+            needs_tessellation: false,
         }
     }
 
-    /// Render a frame using Rive-style GPU tessellation.
+    /// Render all draw commands in a single frame.
+    ///
+    /// `world_transform` is applied on top of every draw command's existing transform
+    /// (pass `Mat2D::identity()` if paths are already in screen space).
     pub fn render(
         &mut self,
         ctx: &RenderContext,
@@ -58,51 +59,41 @@ impl RenderCanvas {
         let output = surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
 
-        // Update frame uniforms
+        // Frame uniforms
         let uniforms = FrameUniforms {
             view_proj: ortho_projection(ctx.width as f32, ctx.height as f32),
             resolution: [ctx.width as f32, ctx.height as f32],
             time,
-            _pad: 0.0,
+            is_srgb: ctx.is_srgb as u32,
         };
         self.gpu_buffers.update_uniforms(&ctx.queue, &uniforms);
 
-        // Phase 1: CPU — encode paths into GPU tessellation data + paints
+        // Encode paths: fills (lyon CPU) + strokes (compute GPU)
         let encoded = encode_paths(draws, world_transform);
 
-        // Diagnostic: log stats on first frame with content
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
+        if !LOGGED.load(std::sync::atomic::Ordering::Relaxed) && encoded.total_vertex_count() > 0 {
             LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
             log::info!(
-                "GPU tess: {} draw cmds → {} segments, {} vertices, {} indices, {} paints",
-                draws.len(), encoded.segments.len(), encoded.total_vertices,
-                encoded.indices.len(), encoded.paints.len()
+                "GPU pipeline: {} draws → {} fill_verts, {} fill_idx, {} stroke_segs, {} stroke_idx, {} paints",
+                draws.len(),
+                encoded.fill_vertices.len(),
+                encoded.fill_indices.len(),
+                encoded.segments.len(),
+                encoded.stroke_indices.len(),
+                encoded.paints.len(),
             );
-            for (i, d) in draws.iter().enumerate().take(10) {
-                let paint_desc = match &d.paint {
-                    crate::scene::layer::ShapePaint::SolidFill { color, opacity, .. } =>
-                        format!("fill({:.2},{:.2},{:.2},a={:.2})", color.r, color.g, color.b, opacity),
-                    crate::scene::layer::ShapePaint::SolidStroke { color, opacity, width, .. } =>
-                        format!("stroke({:.2},{:.2},{:.2},a={:.2},w={:.1})", color.r, color.g, color.b, opacity, width),
-                    crate::scene::layer::ShapePaint::GradientFill { gradient_type, .. } =>
-                        format!("grad_fill({:?})", gradient_type),
-                    crate::scene::layer::ShapePaint::GradientStroke { gradient_type, .. } =>
-                        format!("grad_stroke({:?})", gradient_type),
-                };
-                log::info!("  draw[{}]: {} verbs, {} pts, paint={}", i, d.path.verbs.len(), d.path.points.len(), paint_desc);
-            }
-            if draws.len() > 10 { log::info!("  ... and {} more", draws.len() - 10); }
         }
 
         self.gpu_buffers.upload_encoded_paths(&ctx.device, &ctx.queue, &encoded);
+        self.needs_tessellation = true;
 
         let mut encoder = ctx.device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("render encoder"),
         });
 
-        // Phase 2: GPU compute — tessellate cubics into vertices
-        if self.gpu_buffers.segment_count > 0 {
+        // Compute pass: tessellate stroke cubics (only if strokes present)
+        if self.needs_tessellation && self.gpu_buffers.segment_count > 0 {
             if let Some(tess_bind_group) = self.gpu_buffers.create_tessellate_bind_group(
                 &ctx.device,
                 &self.tessellate_bind_group_layout,
@@ -113,14 +104,13 @@ impl RenderCanvas {
                 });
                 compute_pass.set_pipeline(&self.tessellate_pipeline);
                 compute_pass.set_bind_group(0, &tess_bind_group, &[]);
-
-                // Dispatch: one thread per segment, workgroup size 64
                 let workgroups = (self.gpu_buffers.segment_count + 63) / 64;
                 compute_pass.dispatch_workgroups(workgroups, 1, 1);
             }
+            self.needs_tessellation = false;
         }
 
-        // Phase 3: GPU draw — render tessellated vertices (MSAA → resolve)
+        // Draw pass
         {
             let (color_view, resolve) = if let Some(msaa_view) = &ctx.msaa_view {
                 (msaa_view, Some(&view))
@@ -147,16 +137,14 @@ impl RenderCanvas {
                     &ctx.device,
                     &self.uniform_bind_group_layout,
                 );
-
                 render_pass.set_pipeline(&self.path_pipeline);
                 render_pass.set_bind_group(0, &uniform_bind_group, &[]);
 
-                // Set paint bind group (group 1)
-                if let Some(paint_bind_group) = self.gpu_buffers.create_paint_bind_group(
+                if let Some(paint_bg) = self.gpu_buffers.create_paint_bind_group(
                     &ctx.device,
                     &self.paint_bind_group_layout,
                 ) {
-                    render_pass.set_bind_group(1, &paint_bind_group, &[]);
+                    render_pass.set_bind_group(1, &paint_bg, &[]);
                 }
 
                 if let Some(vb) = &self.gpu_buffers.vertex_buffer {

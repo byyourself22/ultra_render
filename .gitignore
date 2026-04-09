@@ -12,7 +12,8 @@
 /opengl32.def
 /opengl32.exp
 /opengl32.lib
+*node_modules
 
 # Local third-party checkouts
-/thorvg/
-/rive-runtime/
+
+

@@ -3,21 +3,44 @@ name = "ultra_render"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["native"]
+native = ["wgpu/dx12", "dep:pollster", "dep:env_logger", "dep:zip"]
+web = ["wgpu/webgpu", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_log", "dep:console_error_panic_hook", "dep:web-sys", "dep:js-sys", "dep:web-time"]
+
 [dependencies]
-wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12"] }
+wgpu = { version = "24", default-features = false, features = ["wgsl"] }
 winit = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.29", features = ["bytemuck"] }
-pollster = "0.4"
 log = "0.4"
-env_logger = "0.11"
-zip = "2"
 lyon = { version = "1", features = [] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 flate2 = "1"
 bitflags = "2"
+zip = { version = "2", optional = true }
+
+# Native-only (activated by "native" feature)
+pollster = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+
+# WASM-only (activated by "web" feature)
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+console_log = { version = "1", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Window", "Document", "Element", "HtmlCanvasElement",
+    "Request", "RequestInit", "RequestMode", "Response",
+    "Headers",
+] }
+js-sys = { version = "0.3", optional = true }
+web-time = { version = "1", optional = true }
 
 [profile.release]
 opt-level = 3

@@ -83,6 +83,10 @@ pub struct LayerData {
     pub hidden: bool,
     pub transform_data: LottieTransform,
     pub shapes: Vec<ShapeItem>,
+    // Solid layer fields (LayerType::Solid)
+    pub solid_color: Option<String>,
+    pub solid_width: Option<f32>,
+    pub solid_height: Option<f32>,
 }
 
 // ─── Artboard ───────────────────────────────────────────────
@@ -151,6 +155,9 @@ impl Artboard {
                     hidden: layer.hidden,
                     transform_data: layer.transform.clone(),
                     shapes: layer.shapes.clone(),
+                    solid_color: layer.solid_color.clone(),
+                    solid_width: layer.solid_width,
+                    solid_height: layer.solid_height,
                 }),
             };
             nodes.push(node);
@@ -195,6 +202,9 @@ impl Artboard {
                     hidden: child_layer.hidden,
                     transform_data: child_layer.transform.clone(),
                     shapes: child_layer.shapes.clone(),
+                    solid_color: child_layer.solid_color.clone(),
+                    solid_width: child_layer.solid_width,
+                    solid_height: child_layer.solid_height,
                 }),
             });
         }
@@ -432,7 +442,31 @@ impl Artboard {
                     }
                 }
                 LayerType::Solid => {
-                    // TODO: render solid color rectangle
+                    // Render solid color rectangle using the layer's world transform
+                    if let (Some(color_hex), Some(w), Some(h)) = (
+                        &layer_data.solid_color,
+                        layer_data.solid_width,
+                        layer_data.solid_height,
+                    ) {
+                        let color = parse_hex_color(color_hex);
+                        let opacity = node.transform.opacity;
+                        let world = node.transform.world;
+
+                        // Build axis-aligned rect path in local space
+                        let mut path = crate::geometry::path::RawPath::new();
+                        path.add_rect(0.0, 0.0, w, h);
+                        let path = path.transform(&world);
+
+                        commands.push(ShapeDrawCommand {
+                            path,
+                            paint: super::layer::ShapePaint::SolidFill {
+                                color,
+                                opacity,
+                                fill_rule: crate::geometry::path::FillRule::NonZero,
+                            },
+                            blend_mode: layer_data.blend_mode,
+                        });
+                    }
                 }
                 _ => {
                     // Any other layer type: still recurse children
@@ -729,6 +763,15 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
             _ => {}
         }
     }
+}
+
+/// Parse a Lottie solid layer hex color string (e.g. "#ff8800") to Color.
+fn parse_hex_color(hex: &str) -> crate::geometry::math::Color {
+    let hex = hex.trim_start_matches('#');
+    let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
+    let g = u8::from_str_radix(&hex.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
+    let b = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
+    crate::geometry::math::Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
 }
 
 #[cfg(test)]
