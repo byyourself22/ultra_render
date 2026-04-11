@@ -1,3 +1,6 @@
+use super::animation::AnimationPlayer;
+use super::layer::{bezier_to_raw_path, ShapeDrawCommand, ShapePaint};
+use super::transform::{evaluate_transform, ComputedTransform};
 /// Rive-style Artboard — main container for animation playback and rendering.
 ///
 /// Mirrors Rive's Artboard architecture:
@@ -5,15 +8,11 @@
 /// - DAG-ordered component updates (topological sort by parent hierarchy)
 /// - advance() / draw() cycle
 /// - Drawable list for efficient rendering
-
 use crate::geometry::math::{Mat2D, AABB};
 use crate::geometry::path::RawPath;
 use crate::lottie::model::*;
-use crate::lottie::property::*;
 use crate::lottie::modifiers;
-use super::layer::{ShapeDrawCommand, ShapePaint, bezier_to_raw_path};
-use super::transform::{ComputedTransform, evaluate_transform};
-use super::animation::AnimationPlayer;
+use crate::lottie::property::*;
 
 // ─── Dirty Flags (Rive ComponentDirt) ───────────────────────
 
@@ -55,11 +54,12 @@ bitflags::bitflags! {
 pub struct ArtboardNode {
     pub name: String,
     pub node_type: NodeType,
-    pub parent_idx: Option<usize>,      // Index in artboard's nodes array
+    pub parent_idx: Option<usize>,      // Transform parent in the node array
+    pub draw_parent_idx: Option<usize>, // Draw-order owner (root or precomp)
     pub lottie_parent: Option<i32>,     // Lottie parent layer index
     pub lottie_index: Option<i32>,      // Lottie layer index
     pub dirt: ComponentDirt,
-    pub depth: u32,                     // DAG depth for topological ordering
+    pub depth: u32, // DAG depth for topological ordering
     pub transform: ComputedTransform,
     pub layer_data: Option<LayerData>,
 }
@@ -105,11 +105,15 @@ pub struct Artboard {
     pub width: f32,
     pub height: f32,
     pub nodes: Vec<ArtboardNode>,
-    pub update_order: Vec<usize>,       // DAG topological order
+    pub update_order: Vec<usize>, // DAG topological order
     pub player: AnimationPlayer,
     pub draw_cache: Vec<ShapeDrawCommand>,
     pub draw_dirty: bool,
+    pub draw_version: u64,
     pub last_frame: f32,
+    // Cached children list — rebuilt only when node count changes
+    children_cache: Vec<Vec<usize>>,
+    children_dirty: bool,
 }
 
 impl Artboard {
@@ -122,6 +126,7 @@ impl Artboard {
             name: comp.name.clone(),
             node_type: NodeType::Root,
             parent_idx: None,
+            draw_parent_idx: None,
             lottie_parent: None,
             lottie_index: None,
             dirt: ComponentDirt::all(),
@@ -140,6 +145,7 @@ impl Artboard {
                     NodeType::Layer
                 },
                 parent_idx: None, // resolved after all nodes are added
+                draw_parent_idx: Some(0),
                 lottie_parent: layer.parent_index,
                 lottie_index: layer.index,
                 dirt: ComponentDirt::all(),
@@ -187,6 +193,7 @@ impl Artboard {
                     NodeType::Layer
                 },
                 parent_idx: Some(parent_idx),
+                draw_parent_idx: Some(parent_idx),
                 lottie_parent: child_layer.parent_index,
                 lottie_index: child_layer.index,
                 dirt: ComponentDirt::all(),
@@ -230,7 +237,10 @@ impl Artboard {
             player,
             draw_cache: Vec::new(),
             draw_dirty: true,
+            draw_version: 0,
             last_frame: -1.0,
+            children_cache: Vec::new(),
+            children_dirty: true,
         }
     }
 
@@ -244,7 +254,8 @@ impl Artboard {
             self.last_frame = frame;
             // Mark all nodes with transform dirt
             for node in &mut self.nodes {
-                node.dirt.insert(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM);
+                node.dirt
+                    .insert(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM);
             }
             self.draw_dirty = true;
         }
@@ -255,10 +266,11 @@ impl Artboard {
     /// Update all components in DAG order (Rive Artboard::update)
     pub fn update(&mut self) {
         let frame = self.player.frame;
-        let order = self.update_order.clone();
-
-        for &idx in &order {
-            if !self.nodes[idx].dirt.intersects(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM) {
+        for &idx in &self.update_order {
+            if !self.nodes[idx]
+                .dirt
+                .intersects(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM)
+            {
                 continue; // Clean node, skip
             }
 
@@ -273,28 +285,43 @@ impl Artboard {
                 parent_opacity = 1.0;
             }
 
-            if let Some(ref layer_data) = self.nodes[idx].layer_data.clone() {
-                // Compute effective frame considering parent precomp timing
-                let eff_frame = if let Some(parent_idx) = self.nodes[idx].parent_idx {
-                    if let Some(parent_data) = &self.nodes[parent_idx].layer_data {
-                        (frame - parent_data.start_time) / parent_data.stretch
-                    } else {
-                        frame
-                    }
+            let Some((start_time, stretch, transform_data)) =
+                self.nodes[idx].layer_data.as_ref().map(|layer_data| {
+                    (
+                        layer_data.start_time,
+                        layer_data.stretch,
+                        layer_data.transform_data.clone(),
+                    )
+                })
+            else {
+                self.nodes[idx]
+                    .dirt
+                    .remove(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM);
+                continue;
+            };
+
+            // Compute effective frame considering parent precomp timing
+            let eff_frame = if let Some(parent_idx) = self.nodes[idx].parent_idx {
+                if let Some(parent_data) = &self.nodes[parent_idx].layer_data {
+                    (frame - parent_data.start_time) / parent_data.stretch
                 } else {
                     frame
-                };
+                }
+            } else {
+                frame
+            };
 
-                let local_frame = (eff_frame - layer_data.start_time) / layer_data.stretch;
-                let (local_mat, opacity) = evaluate_transform(&layer_data.transform_data, local_frame);
+            let local_frame = (eff_frame - start_time) / stretch;
+            let (local_mat, opacity) = evaluate_transform(&transform_data, local_frame);
 
-                self.nodes[idx].transform.local = local_mat;
-                self.nodes[idx].transform.world = Mat2D::multiply(&parent_world, &local_mat);
-                self.nodes[idx].transform.opacity = parent_opacity * opacity;
-            }
+            self.nodes[idx].transform.local = local_mat;
+            self.nodes[idx].transform.world = Mat2D::multiply(&parent_world, &local_mat);
+            self.nodes[idx].transform.opacity = parent_opacity * opacity;
 
             // Clear dirt
-            self.nodes[idx].dirt.remove(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM);
+            self.nodes[idx]
+                .dirt
+                .remove(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM);
         }
     }
 
@@ -312,46 +339,57 @@ impl Artboard {
 
         // Compute effective frame for each node considering parent precomp timing.
         // Walk up the parent chain to accumulate time remapping for nested precomps.
-        let effective_frames: Vec<f32> = (0..self.nodes.len()).map(|idx| {
-            self.compute_effective_frame(idx, frame)
-        }).collect();
+        let effective_frames: Vec<f32> = (0..self.nodes.len())
+            .map(|idx| self.compute_effective_frame(idx, frame))
+            .collect();
 
-        // Build children list per node for tree traversal
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
-        for i in 1..self.nodes.len() {
-            if let Some(parent_idx) = self.nodes[i].parent_idx {
-                children[parent_idx].push(i);
+        // Build/reuse children list (only rebuilds when structure changes)
+        if self.children_dirty || self.children_cache.len() != self.nodes.len() {
+            self.children_cache = vec![Vec::new(); self.nodes.len()];
+            for i in 1..self.nodes.len() {
+                if let Some(draw_parent_idx) = self.nodes[i].draw_parent_idx {
+                    self.children_cache[draw_parent_idx].push(i);
+                }
             }
+            self.children_dirty = false;
         }
 
-        // Identify main-level layers (direct children of root, or layers whose parent
-        // is a non-precomp node at root level)
-        let root_children: Vec<usize> = children[0].clone();
+        let root_children = &self.children_cache[0];
 
         // Debug: log node info on first draw
-        static DRAW_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static DRAW_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if !DRAW_LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
             DRAW_LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
-            log::info!("Artboard draw: frame={:.1}, {} nodes, root_children={:?}", frame, self.nodes.len(), root_children);
+            log::info!(
+                "Artboard draw: frame={:.1}, {} nodes, root_children={:?}",
+                frame,
+                self.nodes.len(),
+                root_children
+            );
             for (i, node) in self.nodes.iter().enumerate() {
                 if let Some(ref ld) = node.layer_data {
                     let eff = effective_frames[i];
                     let vis = !ld.hidden && eff >= ld.in_point && eff < ld.out_point;
-                    log::info!("  node[{}] '{}' {:?} parent={:?} eff_frame={:.1} in={:.0}..{:.0} hidden={} shapes={} vis={}",
-                        i, node.name, ld.layer_type, node.parent_idx, eff, ld.in_point, ld.out_point, ld.hidden, ld.shapes.len(), vis);
+                    log::info!("  node[{}] '{}' {:?} parent={:?} draw_parent={:?} eff_frame={:.1} in={:.0}..{:.0} hidden={} shapes={} vis={}",
+                        i, node.name, ld.layer_type, node.parent_idx, node.draw_parent_idx, eff, ld.in_point, ld.out_point, ld.hidden, ld.shapes.len(), vis);
                 }
             }
         }
 
         // Collect draws tree-recursively, back-to-front (ThorVG layer ordering)
+        let children = &self.children_cache;
         let mut cache = Vec::new();
-        self.collect_draws_recursive(
-            &root_children, &children, &effective_frames, &mut cache,
-        );
+        self.collect_draws_recursive(root_children, children, &effective_frames, &mut cache);
         self.draw_cache = cache;
 
+        self.draw_version = self.draw_version.wrapping_add(1);
         self.draw_dirty = false;
         &self.draw_cache
+    }
+
+    pub fn draw_version(&self) -> u64 {
+        self.draw_version
     }
 
     /// Compute effective frame for a node, walking up the parent chain
@@ -361,7 +399,9 @@ impl Artboard {
         let mut current = idx;
         // Walk up to find precomp parents and apply their time remapping
         while let Some(parent_idx) = self.nodes[current].parent_idx {
-            if parent_idx == 0 { break; }
+            if parent_idx == 0 {
+                break;
+            }
             if let Some(parent_data) = &self.nodes[parent_idx].layer_data {
                 if parent_data.layer_type == LayerType::Precomp {
                     eff = (eff - parent_data.start_time) / parent_data.stretch;
@@ -373,7 +413,7 @@ impl Artboard {
     }
 
     /// Recursively collect draws in correct Lottie layer order (back-to-front = reversed).
-    /// Precomp layers expand into their children inline.
+    /// Only precomp ownership affects draw tree; normal parenting only affects transforms.
     fn collect_draws_recursive(
         &self,
         layer_indices: &[usize],
@@ -381,7 +421,6 @@ impl Artboard {
         effective_frames: &[f32],
         commands: &mut Vec<ShapeDrawCommand>,
     ) {
-        // Lottie layers are stored front-to-back; iterate in reverse for back-to-front
         for &idx in layer_indices.iter().rev() {
             let node = &self.nodes[idx];
             let layer_data = match &node.layer_data {
@@ -408,41 +447,26 @@ impl Artboard {
 
                     for mut draw in draws {
                         draw.path = draw.path.transform(&world);
+                        draw.paint.apply_transform(&world);
                         draw.paint.apply_opacity(opacity);
                         if layer_blend != BlendMode::Normal {
                             draw.blend_mode = layer_blend;
                         }
                         commands.push(draw);
                     }
-
-                    // Also recurse into child layers that use this shape as parent
-                    // (Lottie parent hierarchy = transform inheritance, not grouping)
-                    let shape_children = &children[idx];
-                    if !shape_children.is_empty() {
-                        self.collect_draws_recursive(
-                            shape_children, children, effective_frames, commands,
-                        );
-                    }
                 }
                 LayerType::Precomp => {
                     let precomp_children = &children[idx];
                     if !precomp_children.is_empty() {
                         self.collect_draws_recursive(
-                            precomp_children, children, effective_frames, commands,
-                        );
-                    }
-                }
-                LayerType::Null => {
-                    // Null layers are transform-only; recurse into children
-                    let null_children = &children[idx];
-                    if !null_children.is_empty() {
-                        self.collect_draws_recursive(
-                            null_children, children, effective_frames, commands,
+                            precomp_children,
+                            children,
+                            effective_frames,
+                            commands,
                         );
                     }
                 }
                 LayerType::Solid => {
-                    // Render solid color rectangle using the layer's world transform
                     if let (Some(color_hex), Some(w), Some(h)) = (
                         &layer_data.solid_color,
                         layer_data.solid_width,
@@ -452,7 +476,6 @@ impl Artboard {
                         let opacity = node.transform.opacity;
                         let world = node.transform.world;
 
-                        // Build axis-aligned rect path in local space
                         let mut path = crate::geometry::path::RawPath::new();
                         path.add_rect(0.0, 0.0, w, h);
                         let path = path.transform(&world);
@@ -465,18 +488,11 @@ impl Artboard {
                                 fill_rule: crate::geometry::path::FillRule::NonZero,
                             },
                             blend_mode: layer_data.blend_mode,
+                            sprite_index: 0,
                         });
                     }
                 }
-                _ => {
-                    // Any other layer type: still recurse children
-                    let other_children = &children[idx];
-                    if !other_children.is_empty() {
-                        self.collect_draws_recursive(
-                            other_children, children, effective_frames, commands,
-                        );
-                    }
-                }
+                _ => {}
             }
         }
     }
@@ -489,6 +505,24 @@ impl Artboard {
     /// Get current frame
     pub fn frame(&self) -> f32 {
         self.player.frame
+    }
+
+    /// Copy playback state from another artboard without rebuilding draw data.
+    /// Used for synced sprite instances where only the master artboard is evaluated.
+    pub fn sync_playback_from(&mut self, other: &Artboard) {
+        self.player = other.player.clone();
+        self.last_frame = other.last_frame;
+    }
+
+    /// Seek to a frame and force transforms/draws to rebuild on the next update.
+    pub fn seek_frame(&mut self, frame: f32) {
+        self.player.seek(frame);
+        self.last_frame = -1.0;
+        self.draw_dirty = true;
+        for node in &mut self.nodes {
+            node.dirt
+                .insert(ComponentDirt::TRANSFORM | ComponentDirt::WORLD_TRANSFORM);
+        }
     }
 
     /// Mark a specific node dirty
@@ -532,53 +566,21 @@ fn extract_group_transform(shapes: &[ShapeItem], frame: f32) -> Option<(Mat2D, f
 // ─── DAG helpers ────────────────────────────────────────────
 
 /// Resolve lottie_parent indices to node array indices.
-/// ThorVG-style: parent lookup is scoped to siblings within the same precomp context.
+/// Parent lookup is scoped to the draw owner (root or precomp), not global layer order.
 fn resolve_parent_indices(nodes: &mut [ArtboardNode]) {
-    // For each node, determine its "scope parent" — the precomp node that owns it.
-    // Main-level layers have scope_parent = 0 (root).
-    // Precomp children already have parent_idx set to their precomp parent.
-    let scope_parents: Vec<Option<usize>> = nodes.iter().map(|n| n.parent_idx).collect();
-
-    // Build scoped lookup: group nodes by their scope parent
-    // Main-level layers: parent_idx is None (will be resolved) -> scope is root (0)
-    // Precomp children: parent_idx is Some(precomp_node_idx)
+    let scope_parents: Vec<Option<usize>> = nodes.iter().map(|n| n.draw_parent_idx).collect();
 
     for i in 1..nodes.len() {
-        if nodes[i].parent_idx.is_some() {
-            // Already resolved (precomp children set to their precomp parent).
-            // But they may have lottie_parent referring to a sibling within the precomp.
-            if let Some(lottie_parent) = nodes[i].lottie_parent {
-                let my_scope = scope_parents[i];
-                // Search for a sibling with matching lottie_index in the same scope
-                let found = nodes.iter().enumerate().find(|(j, n)| {
-                    *j != i
-                        && n.lottie_index == Some(lottie_parent)
-                        && scope_parents[*j] == my_scope
-                });
-                if let Some((parent_node_idx, _)) = found {
-                    nodes[i].parent_idx = Some(parent_node_idx);
-                }
-                // else: keep the precomp parent (already set)
-            }
-            continue;
-        }
+        let fallback_parent = scope_parents[i].unwrap_or(0);
 
-        // Main-level layer: scope is root
         if let Some(lottie_parent) = nodes[i].lottie_parent {
-            // Find a sibling main-level layer with matching lottie_index
+            let my_scope = scope_parents[i];
             let found = nodes.iter().enumerate().find(|(j, n)| {
-                *j != i
-                    && *j != 0  // skip root node
-                    && n.lottie_index == Some(lottie_parent)
-                    && scope_parents[*j].is_none()  // also a main-level layer
+                *j != i && n.lottie_index == Some(lottie_parent) && scope_parents[*j] == my_scope
             });
-            if let Some((parent_node_idx, _)) = found {
-                nodes[i].parent_idx = Some(parent_node_idx);
-            } else {
-                nodes[i].parent_idx = Some(0); // Root
-            }
+            nodes[i].parent_idx = Some(found.map(|(parent_node_idx, _)| parent_node_idx).unwrap_or(fallback_parent));
         } else {
-            nodes[i].parent_idx = Some(0); // Root
+            nodes[i].parent_idx = Some(fallback_parent);
         }
     }
 }
@@ -614,7 +616,11 @@ fn generate_shape_draws(shapes: &[ShapeItem], frame: f32) -> Vec<ShapeDrawComman
     commands
 }
 
-fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<ShapeDrawCommand>) {
+fn collect_shape_draws_artboard(
+    shapes: &[ShapeItem],
+    frame: f32,
+    commands: &mut Vec<ShapeDrawCommand>,
+) {
     let mods = modifiers::collect_modifiers(shapes);
     let mut paths: Vec<RawPath> = Vec::new();
 
@@ -629,6 +635,7 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
                 if let Some((mat, opacity)) = group_transform {
                     for mut cmd in group_commands {
                         cmd.path = cmd.path.transform(&mat);
+                        cmd.paint.apply_transform(&mat);
                         cmd.paint.apply_opacity(opacity);
                         commands.push(cmd);
                     }
@@ -673,8 +680,15 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
                 let inner_round = eval_f32(&star.inner_roundness, frame) / 100.0;
                 let is_star = star.star_type == PolystarType::Star;
                 path.add_polystar(
-                    pos.x, pos.y, points as u32, outer_r, inner_r,
-                    outer_round, inner_round, rotation, is_star,
+                    pos.x,
+                    pos.y,
+                    points as u32,
+                    outer_r,
+                    inner_r,
+                    outer_round,
+                    inner_round,
+                    rotation,
+                    is_star,
                 );
                 paths.push(path);
             }
@@ -689,8 +703,13 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
                 for p in &modified {
                     commands.push(ShapeDrawCommand {
                         path: p.clone(),
-                        paint: ShapePaint::SolidFill { color, opacity, fill_rule: fill.fill_rule },
+                        paint: ShapePaint::SolidFill {
+                            color,
+                            opacity,
+                            fill_rule: fill.fill_rule,
+                        },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -707,11 +726,15 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
                     commands.push(ShapeDrawCommand {
                         path: p.clone(),
                         paint: ShapePaint::SolidStroke {
-                            color, opacity, width,
-                            cap: stroke.line_cap, join: stroke.line_join,
+                            color,
+                            opacity,
+                            width,
+                            cap: stroke.line_cap,
+                            join: stroke.line_join,
                             miter_limit: stroke.miter_limit,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -729,10 +752,15 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
                     commands.push(ShapeDrawCommand {
                         path: p.clone(),
                         paint: ShapePaint::GradientFill {
-                            gradient_type: gf.gradient_type, start, end,
-                            colors: colors.clone(), opacity, fill_rule: gf.fill_rule,
+                            gradient_type: gf.gradient_type,
+                            start,
+                            end,
+                            colors: colors.clone(),
+                            opacity,
+                            fill_rule: gf.fill_rule,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -751,12 +779,18 @@ fn collect_shape_draws_artboard(shapes: &[ShapeItem], frame: f32, commands: &mut
                     commands.push(ShapeDrawCommand {
                         path: p.clone(),
                         paint: ShapePaint::GradientStroke {
-                            gradient_type: gs.gradient_type, start, end,
-                            colors: colors.clone(), opacity, width,
-                            cap: gs.line_cap, join: gs.line_join,
+                            gradient_type: gs.gradient_type,
+                            start,
+                            end,
+                            colors: colors.clone(),
+                            opacity,
+                            width,
+                            cap: gs.line_cap,
+                            join: gs.line_join,
                             miter_limit: gs.miter_limit,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -861,21 +895,29 @@ mod tests {
         // The rect is at (0,0)-(10,10) but group transform shifts by (50,50)
         // So all path points should be offset by (50,50)
         let bounds = draws[0].path.bounds();
-        assert!(bounds.min_x >= 45.0, "X should be shifted by group transform, got {}", bounds.min_x);
-        assert!(bounds.min_y >= 45.0, "Y should be shifted by group transform, got {}", bounds.min_y);
+        assert!(
+            bounds.min_x >= 45.0,
+            "X should be shifted by group transform, got {}",
+            bounds.min_x
+        );
+        assert!(
+            bounds.min_y >= 45.0,
+            "Y should be shifted by group transform, got {}",
+            bounds.min_y
+        );
     }
 
     #[test]
     fn test_layer_ordering_back_to_front() {
         // Layer 0 (red) should render before Layer 1 (blue) — back-to-front
-        let red_layer = make_shape_layer(0, vec![
-            make_rect(0.0, 0.0, 10.0, 10.0),
-            make_fill(1.0, 0.0, 0.0),
-        ]);
-        let blue_layer = make_shape_layer(1, vec![
-            make_rect(0.0, 0.0, 10.0, 10.0),
-            make_fill(0.0, 0.0, 1.0),
-        ]);
+        let red_layer = make_shape_layer(
+            0,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(1.0, 0.0, 0.0)],
+        );
+        let blue_layer = make_shape_layer(
+            1,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(0.0, 0.0, 1.0)],
+        );
 
         let mut comp = make_test_composition();
         // Lottie layers are front-to-back: first in array renders on top
@@ -906,10 +948,10 @@ mod tests {
     #[test]
     fn test_layer_visibility_timing() {
         // Layer only visible in frames 10..20
-        let mut layer = make_shape_layer(0, vec![
-            make_rect(0.0, 0.0, 10.0, 10.0),
-            make_fill(1.0, 0.0, 0.0),
-        ]);
+        let mut layer = make_shape_layer(
+            0,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(1.0, 0.0, 0.0)],
+        );
         layer.in_point = 10.0;
         layer.out_point = 20.0;
 
@@ -922,7 +964,9 @@ mod tests {
         // Frame 0: not visible
         artboard.player.seek(0.0);
         artboard.draw_dirty = true;
-        for node in &mut artboard.nodes { node.dirt = ComponentDirt::all(); }
+        for node in &mut artboard.nodes {
+            node.dirt = ComponentDirt::all();
+        }
         artboard.update();
         let draws = artboard.draw();
         assert!(draws.is_empty(), "Layer should not be visible at frame 0");
@@ -931,7 +975,9 @@ mod tests {
         artboard.player.seek(15.0);
         artboard.draw_dirty = true;
         artboard.last_frame = -1.0;
-        for node in &mut artboard.nodes { node.dirt = ComponentDirt::all(); }
+        for node in &mut artboard.nodes {
+            node.dirt = ComponentDirt::all();
+        }
         artboard.update();
         let draws = artboard.draw();
         assert!(!draws.is_empty(), "Layer should be visible at frame 15");
@@ -952,10 +998,10 @@ mod tests {
             ..Default::default()
         };
 
-        let mut child_layer = make_shape_layer(1, vec![
-            make_rect(0.0, 0.0, 10.0, 10.0),
-            make_fill(1.0, 0.0, 0.0),
-        ]);
+        let mut child_layer = make_shape_layer(
+            1,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(1.0, 0.0, 0.0)],
+        );
         child_layer.parent_index = Some(0); // parent is layer index 0
 
         let mut comp = make_test_composition();
@@ -970,8 +1016,16 @@ mod tests {
         assert!(!draws.is_empty(), "Should produce draws");
         // Child rect is at (0,0)-(10,10), parent shifts by (30,30)
         let bounds = draws[0].path.bounds();
-        assert!(bounds.min_x >= 25.0, "Child should inherit parent position, got min_x={}", bounds.min_x);
-        assert!(bounds.min_y >= 25.0, "Child should inherit parent position, got min_y={}", bounds.min_y);
+        assert!(
+            bounds.min_x >= 25.0,
+            "Child should inherit parent position, got min_x={}",
+            bounds.min_x
+        );
+        assert!(
+            bounds.min_y >= 25.0,
+            "Child should inherit parent position, got min_y={}",
+            bounds.min_y
+        );
     }
 
     #[test]
@@ -989,16 +1043,21 @@ mod tests {
             ..Default::default()
         };
 
-        let mut child_layer = make_shape_layer(1, vec![
-            make_rect(0.0, 0.0, 10.0, 10.0),
-            ShapeItem::Fill(ShapeFill {
-                name: "fill".into(),
-                color: AnimatedValue::Static(crate::geometry::math::Color::new(1.0, 0.0, 0.0, 1.0)),
-                opacity: AnimatedValue::Static(80.0), // 80%
-                fill_rule: crate::geometry::path::FillRule::NonZero,
-                hidden: false,
-            }),
-        ]);
+        let mut child_layer = make_shape_layer(
+            1,
+            vec![
+                make_rect(0.0, 0.0, 10.0, 10.0),
+                ShapeItem::Fill(ShapeFill {
+                    name: "fill".into(),
+                    color: AnimatedValue::Static(crate::geometry::math::Color::new(
+                        1.0, 0.0, 0.0, 1.0,
+                    )),
+                    opacity: AnimatedValue::Static(80.0), // 80%
+                    fill_rule: crate::geometry::path::FillRule::NonZero,
+                    hidden: false,
+                }),
+            ],
+        );
         child_layer.parent_index = Some(0);
 
         let mut comp = make_test_composition();
@@ -1014,8 +1073,11 @@ mod tests {
         match &draws[0].paint {
             ShapePaint::SolidFill { opacity, .. } => {
                 // 0.8 (fill) * 0.5 (parent) = 0.4
-                assert!((opacity - 0.4).abs() < 0.05,
-                    "Effective opacity should be ~0.4, got {}", opacity);
+                assert!(
+                    (opacity - 0.4).abs() < 0.05,
+                    "Effective opacity should be ~0.4, got {}",
+                    opacity
+                );
             }
             _ => panic!("Expected SolidFill"),
         }
@@ -1027,12 +1089,10 @@ mod tests {
         let asset = LottieAsset {
             id: "precomp_1".into(),
             name: "precomp".into(),
-            layers: vec![
-                make_shape_layer(0, vec![
-                    make_rect(0.0, 0.0, 20.0, 20.0),
-                    make_fill(0.0, 1.0, 0.0),
-                ]),
-            ],
+            layers: vec![make_shape_layer(
+                0,
+                vec![make_rect(0.0, 0.0, 20.0, 20.0), make_fill(0.0, 1.0, 0.0)],
+            )],
             width: Some(100.0),
             height: Some(100.0),
             path: None,
@@ -1068,12 +1128,76 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn test_parented_layers_keep_global_draw_order() {
+        let mut child = make_shape_layer(
+            1,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(0.0, 1.0, 0.0)],
+        );
+        child.parent_index = Some(3);
+
+        let sibling = make_shape_layer(
+            2,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(0.0, 0.0, 1.0)],
+        );
+
+        let parent = make_shape_layer(
+            3,
+            vec![make_rect(0.0, 0.0, 10.0, 10.0), make_fill(1.0, 0.0, 0.0)],
+        );
+
+        let mut comp = make_test_composition();
+        comp.layers = vec![child, sibling, parent];
+
+        let mut artboard = Artboard::from_lottie(&comp);
+        artboard.play();
+        artboard.advance(0.0);
+        artboard.update();
+        let draws = artboard.draw();
+
+        let colors: Vec<(u8, u8, u8)> = draws
+            .iter()
+            .filter_map(|draw| match &draw.paint {
+                ShapePaint::SolidFill { color, .. } => Some((
+                    (color.r * 255.0).round() as u8,
+                    (color.g * 255.0).round() as u8,
+                    (color.b * 255.0).round() as u8,
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(colors, vec![(255, 0, 0), (0, 0, 255), (0, 255, 0)]);
+    }
+
     #[test]
     fn test_draw_sort_key() {
         use crate::renderer::draw::*;
         // Verify sort key ordering: higher blend mode → higher key
-        let k1 = build_sort_key(BlendMode::Normal, DrawContents::Opaque, 0, DrawType::MidpointFanFill);
-        let k2 = build_sort_key(BlendMode::Multiply, DrawContents::Opaque, 0, DrawType::MidpointFanFill);
+        let k1 = build_sort_key(
+            BlendMode::Normal,
+            DrawContents::Opaque,
+            0,
+            DrawType::MidpointFanFill,
+        );
+        let k2 = build_sort_key(
+            BlendMode::Multiply,
+            DrawContents::Opaque,
+            0,
+            DrawType::MidpointFanFill,
+        );
         assert!(k2 > k1);
     }
 }
+
+
+
+
+
+
+
+
+
+
+

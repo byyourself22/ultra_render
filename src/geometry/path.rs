@@ -1,4 +1,4 @@
-use super::math::{Vec2D, Mat2D, AABB};
+use super::math::{Mat2D, Vec2D, AABB};
 
 /// Path commands (matching Rive's PathVerb)
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,7 +69,11 @@ impl RawPath {
     pub fn transform(&self, mat: &Mat2D) -> Self {
         let mut result = Self::new();
         result.verbs = self.verbs.clone();
-        result.points = self.points.iter().map(|p| mat.transform_point(*p)).collect();
+        result.points = self
+            .points
+            .iter()
+            .map(|p| mat.transform_point(*p))
+            .collect();
         result
     }
 
@@ -114,7 +118,14 @@ impl RawPath {
         self.line_to(x + w - r, y);
         self.cubic_to(x + w - r + kr, y, x + w, y + r - kr, x + w, y + r);
         self.line_to(x + w, y + h - r);
-        self.cubic_to(x + w, y + h - r + kr, x + w - r + kr, y + h, x + w - r, y + h);
+        self.cubic_to(
+            x + w,
+            y + h - r + kr,
+            x + w - r + kr,
+            y + h,
+            x + w - r,
+            y + h,
+        );
         self.line_to(x + r, y + h);
         self.cubic_to(x + r - kr, y + h, x, y + h - r + kr, x, y + h - r);
         self.line_to(x, y + r);

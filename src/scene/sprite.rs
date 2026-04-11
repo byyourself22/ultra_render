@@ -1,5 +1,5 @@
-use crate::geometry::math::{Vec2D, Mat2D, AABB};
 use super::artboard::Artboard;
+use crate::geometry::math::{Mat2D, Vec2D, AABB};
 
 /// A sprite instance on the canvas.
 /// Each sprite references an Artboard (Rive-style) and has its own transform/playback state.

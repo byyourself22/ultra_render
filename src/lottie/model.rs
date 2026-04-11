@@ -1,4 +1,4 @@
-use crate::geometry::math::{Vec2D, Color};
+use crate::geometry::math::{Color, Vec2D};
 
 /// Root Lottie composition
 #[derive(Clone, Debug)]

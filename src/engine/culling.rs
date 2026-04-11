@@ -3,9 +3,7 @@ use crate::scene::sprite::Sprite;
 
 /// Frustum culling: filter sprites to only those visible in the view
 pub fn cull_sprites<'a>(sprites: &'a [Sprite], view: &AABB) -> Vec<&'a Sprite> {
-    sprites.iter()
-        .filter(|s| s.is_in_view(view))
-        .collect()
+    sprites.iter().filter(|s| s.is_in_view(view)).collect()
 }
 
 /// Simple grid-based spatial index for fast culling with many sprites

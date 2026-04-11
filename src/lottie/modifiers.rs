@@ -4,11 +4,10 @@
 /// Each modifier transforms a RawPath into a new RawPath.
 /// ThorVG implements this as a linked-list chain with `next` pointer;
 /// here we use a Vec<Modifier> applied sequentially.
-
 use crate::geometry::math::Vec2D;
-use crate::geometry::path::{RawPath, PathVerb};
-use crate::lottie::property::eval_f32;
+use crate::geometry::path::{PathVerb, RawPath};
 use crate::lottie::model::*;
+use crate::lottie::property::eval_f32;
 
 /// A path modifier that transforms geometry before painting
 #[derive(Clone, Debug)]
@@ -33,7 +32,12 @@ pub fn apply_modifiers(paths: &[RawPath], modifiers: &[Modifier], frame: f32) ->
 
     for modifier in modifiers {
         result = match modifier {
-            Modifier::TrimPath { start, end, offset, trim_type } => {
+            Modifier::TrimPath {
+                start,
+                end,
+                offset,
+                trim_type,
+            } => {
                 let s = eval_f32(start, frame) / 100.0;
                 let e = eval_f32(end, frame) / 100.0;
                 let o = eval_f32(offset, frame) / 360.0;
@@ -296,7 +300,13 @@ fn trim_path_segment(path: &RawPath, total_len: f32, start_frac: f32, end_frac: 
                     } else {
                         1.0
                     };
-                    let (seg, _) = split_cubic(right[0], right[1], right[2], right[3], adjusted_t1.clamp(0.0, 1.0));
+                    let (seg, _) = split_cubic(
+                        right[0],
+                        right[1],
+                        right[2],
+                        right[3],
+                        adjusted_t1.clamp(0.0, 1.0),
+                    );
 
                     if !started {
                         result.move_to(seg[0].x, seg[0].y);

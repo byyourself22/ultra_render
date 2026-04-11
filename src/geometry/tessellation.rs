@@ -1,27 +1,71 @@
 //! GPU tessellation data structures (Rive-style).
 //!
-//! Fills:   Lyon CPU tessellation → correct concave polygon triangulation.
+//! Fills:   GPU cubic edge tessellation plus CPU-generated index topology.
+//!          Simple fan-safe contours use midpoint fans; concave contours use
+//!          interior triangulation over the sampled edge vertices.
 //! Strokes: GPU compute shader (De Casteljau) → Rive-style offset quad-strips.
 //!
-//! CPU work: walk contours, lyon fills, pack stroke cubics, build index buffer.
-//! GPU work: evaluate stroke curves (De Casteljau), offset by normal.
+//! Instancing:
+//!   Each GpuVertex carries a `sprite_index` referencing the per-sprite transform
+//!   in the GPU storage buffer.  The vertex shader applies that transform so paths
+//!   are kept in LOCAL space and tessellated only ONCE per unique animation frame.
+//!
+//!   Synced batch (N sprites on same frame):
+//!     • Tessellate sprite[0] → V verts, I indices, K paints.
+//!     • Memcpy × N, updating sprite_index per copy.  Index offsets added per copy.
+//!     • Only K paints uploaded (shared; gradient coords are in local space and
+//!       the fragment shader transforms them using sprite_transforms[sprite_index]).
+//!
+//!   Unsynced batch (N sprites on different frames):
+//!     • Tessellate each sprite, concatenate. Each group appends its own K paints.
 
-use super::math::{Vec2D, Mat2D, Color, wang_cubic_segment_count};
-use super::path::{RawPath, PathVerb};
+use super::math::{wang_cubic_segment_count, Color, Mat2D, Vec2D};
+use super::path::{PathVerb, RawPath};
 use bytemuck::{Pod, Zeroable};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 // ─── GPU vertex (output of compute, input to draw) ──────────
 
 /// GPU vertex consumed by the draw shader.
+/// `position` is in LOCAL (artboard) space.
+/// The vertex shader applies `sprite_transforms[sprite_index]` to produce world pos.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuVertex {
-    pub position: [f32; 2],   // screen-space position
-    pub uv: [f32; 2],         // texture coords / stroke AA side
-    pub color: [f32; 4],      // solid color (used when paint_type=0)
-    pub world_pos: [f32; 2],  // pre-transform position for gradient eval
-    pub paint_index: u32,     // index into paint storage buffer
-    pub _pad: u32,
+    pub position: [f32; 2],  // LOCAL space position
+    pub uv: [f32; 2],        // texture coords / stroke AA side
+    pub color: [f32; 4],     // solid color (used when paint_type=0)
+    pub world_pos: [f32; 2], // computed by vertex shader; unused on CPU upload
+    pub paint_index: u32,    // index into paint storage buffer
+    pub sprite_index: u32,   // index into sprite_transforms storage buffer
+}
+
+// ─── Sprite transform (GPU storage buffer element) ──────────
+
+/// Per-sprite 2D affine transform stored in the GPU storage buffer.
+/// Values: [a, b, c, d, tx, ty, _pad, _pad] matching Mat2D::values layout.
+/// Transform point:  x' = a*x + c*y + tx,  y' = b*x + d*y + ty
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct SpriteTransform {
+    pub values: [f32; 8],
+}
+
+impl SpriteTransform {
+    pub fn from_mat2d(m: &Mat2D) -> Self {
+        let v = m.values;
+        Self {
+            values: [v[0], v[1], v[2], v[3], v[4], v[5], 0.0, 0.0],
+        }
+    }
+
+    pub fn identity() -> Self {
+        Self {
+            values: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        }
+    }
 }
 
 // ─── Compute shader inputs ──────────────────────────────────
@@ -29,6 +73,8 @@ pub struct GpuVertex {
 pub const MAX_GRADIENT_STOPS: usize = 16;
 
 /// GPU paint descriptor read by the fragment shader.
+/// Gradient `grad_start` / `grad_end` are stored in LOCAL (artboard) space.
+/// The fragment shader transforms them to world space using `sprite_transforms[sprite_index]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuPaint {
@@ -68,146 +114,1221 @@ pub struct GpuCubicSegment {
     pub color: [f32; 4],
     pub normal_offset: f32,
     pub segment_count: u32,
-    pub first_vertex_idx: u32,  // absolute position in vertex buffer (after fill vertices)
-    pub flags: u32,             // bit0: is_stroke, bit1: write_last
+    pub first_vertex_idx: u32,
+    pub flags: u32,
     pub paint_index: u32,
-    pub _pad: [u32; 3],
+    pub sprite_index: u32,
+    pub _pad: [u32; 2],
 }
 
 /// Per-dispatch metadata for the compute shader.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct TessellateUniforms {
-    pub total_vertices: u32,   // total vertex buffer size (fill + stroke)
+    pub total_vertices: u32,
     pub total_segments: u32,
+    pub _pad: [u32; 2],
+}
+
+// ─── GPU fill tessellation (Rive midpoint fan) ─────────────
+// CPU pushes raw contour/cubic data to GPU. The compute shader tessellates
+// curves and writes edge vertices. CPU builds either midpoint-fan indices for
+// fan-safe contours or interior triangulation indices for concave contours.
+
+/// Per-contour descriptor for GPU fill tessellation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct GpuFillContour {
+    pub midpoint: [f32; 2],
+    pub first_cubic: u32,
+    pub cubic_count: u32,
+    pub first_vertex: u32,
+    pub total_edge_verts: u32,
+    pub first_index: u32,
+    pub simple_fill: u32,
+    pub color: [f32; 4],
+    pub paint_index: u32,
+    pub sprite_index: u32,
+    pub _pad1: [u32; 2],
+}
+
+/// Per-cubic descriptor for GPU fill tessellation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct GpuFillCubic {
+    pub p0: [f32; 2],
+    pub p1: [f32; 2],
+    pub p2: [f32; 2],
+    pub p3: [f32; 2],
+    pub segment_count: u32,
+    pub first_edge_vertex: u32,
+    pub _pad: [u32; 2],
+}
+
+/// Uniforms for the GPU fill tessellation compute shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct FillTessUniforms {
+    pub total_cubics: u32,
+    pub total_contours: u32,
     pub _pad: [u32; 2],
 }
 
 // ─── Encoded path data ──────────────────────────────────────
 
-/// Result of encoding paths for the GPU pipeline.
-///
-/// Fills: CPU-tessellated via Lyon → uploaded directly to start of vertex buffer.
-/// Strokes: GPU compute (De Casteljau) → segments describe what compute shader writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComplexFillRule {
+    NonZero,
+    EvenOdd,
+}
+
+impl Default for ComplexFillRule {
+    fn default() -> Self {
+        Self::NonZero
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ComplexFillDraw {
+    pub stencil_index_start: u32,
+    pub stencil_index_count: u32,
+    pub cover_index_start: u32,
+    pub cover_index_count: u32,
+    pub fill_rule: ComplexFillRule,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimpleDrawSource {
+    Fill,
+    Stroke,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EncodedDraw {
+    Simple {
+        source: SimpleDrawSource,
+        index_start: u32,
+        index_count: u32,
+    },
+    Complex(ComplexFillDraw),
+}
+
 pub struct EncodedPathData {
-    /// Lyon fill vertices — uploaded directly to vertex_buffer[0..fill_vertex_count].
+    // GPU fill tessellation data (Rive midpoint fan)
+    pub fill_contours: Vec<GpuFillContour>,
+    pub fill_cubics: Vec<GpuFillCubic>,
+    pub fill_vertex_count: u32, // total vertices the compute shader will write
+    pub fill_indices: Vec<u32>, // fill indices over GPU-generated edge vertices
+    pub complex_fill_indices: Vec<u32>,
+    pub complex_fill_draws: Vec<ComplexFillDraw>,
+    pub ordered_draws: Vec<EncodedDraw>,
+    // Pre-populated fill vertices (midpoints written by CPU, edges by GPU)
     pub fill_vertices: Vec<GpuVertex>,
-    /// Indices for fill triangles (referencing fill_vertices region).
-    pub fill_indices: Vec<u32>,
-    /// Stroke cubic segments for compute shader.
+
+    // Stroke GPU tessellation (existing)
     pub segments: Vec<GpuCubicSegment>,
-    /// Indices for stroke triangles (referencing stroke region of vertex buffer).
     pub stroke_indices: Vec<u32>,
-    /// Number of vertex slots consumed by compute shader (for strokes).
     pub stroke_vertex_count: u32,
-    /// Paint descriptors (both fill and stroke).
     pub paints: Vec<GpuPaint>,
+    /// Number of GPU instances to draw. For synced sprites this is N (the sprite
+    /// count); for unsynced it is 1 (transforms are already baked per-vertex).
+    pub instance_count: u32,
 }
 
 impl EncodedPathData {
+    pub fn empty() -> Self {
+        Self {
+            fill_contours: Vec::new(),
+            fill_cubics: Vec::new(),
+            fill_vertex_count: 0,
+            fill_indices: Vec::new(),
+            complex_fill_indices: Vec::new(),
+            complex_fill_draws: Vec::new(),
+            ordered_draws: Vec::new(),
+            fill_vertices: Vec::new(),
+            segments: Vec::new(),
+            stroke_indices: Vec::new(),
+            stroke_vertex_count: 0,
+            paints: Vec::new(),
+            instance_count: 1,
+        }
+    }
+
     pub fn total_vertex_count(&self) -> u32 {
-        self.fill_vertices.len() as u32 + self.stroke_vertex_count
+        self.fill_vertex_count + self.stroke_vertex_count
     }
     pub fn total_index_count(&self) -> u32 {
-        (self.fill_indices.len() + self.stroke_indices.len()) as u32
+        (self.fill_indices.len() + self.stroke_indices.len() + self.complex_fill_indices.len())
+            as u32
     }
     pub fn combined_indices(&self) -> Vec<u32> {
         let mut v = self.fill_indices.clone();
         v.extend_from_slice(&self.stroke_indices);
+        v.extend_from_slice(&self.complex_fill_indices);
         v
-    }
-    pub fn fill_vertex_count(&self) -> u32 {
-        self.fill_vertices.len() as u32
     }
 }
 
-// ─── CPU path encoder ───────────────────────────────────────
+// ─── Public API ─────────────────────────────────────────────
 
 use crate::scene::layer::ShapeDrawCommand;
 
-/// Encode a set of ShapeDrawCommands into GPU-ready tessellation data.
+/// Encode draw commands from multiple sprites for GPU rendering.
 ///
-/// Fills:   Lyon CPU tessellation (correct for concave polygons).
-/// Strokes: Rive-style GPU compute segments (De Casteljau on GPU).
-pub fn encode_paths(
-    commands: &[ShapeDrawCommand],
-    world_transform: &Mat2D,
+/// `sprite_groups`: slice of `(sprite_index, draws)` where paths are in LOCAL space.
+/// `transforms`: per-sprite world transforms (index matches `sprite_index`).
+///
+/// Synced optimisation: if all groups have the same number of draw commands (same
+/// animation frame), tessellates only the first group. Instead of copying vertices
+/// N times, we use GPU instancing — `draw_indexed(indices, 0, 0..N)` — and the
+/// vertex shader selects the transform via `instance_index`.
+///
+/// Returns `EncodedPathData` with `instance_count` set for the renderer.
+pub fn encode_paths_instanced(
+    sprite_groups: &[(u32, Vec<ShapeDrawCommand>)],
+    transforms: &[Mat2D],
+    batch_synced: bool,
 ) -> EncodedPathData {
-    let mut fill_vertices: Vec<GpuVertex> = Vec::new();
-    let mut fill_indices: Vec<u32> = Vec::new();
-    let mut segments: Vec<GpuCubicSegment> = Vec::new();
-    let mut stroke_indices: Vec<u32> = Vec::new();
-    let mut paints: Vec<GpuPaint> = Vec::new();
-    let mut stroke_vertex_cursor: u32 = 0; // relative stroke vertex cursor
-
-    // ── First pass: fills (lyon CPU) ────────────────────────
-    for cmd in commands {
-        let (color, is_stroke, _) = extract_paint_info(&cmd.paint);
-        if is_stroke { continue; }
-
-        let paint_index = paints.len() as u32;
-        paints.push(build_gpu_paint(&cmd.paint, world_transform));
-
-        let path = cmd.path.transform(world_transform);
-        let fill_rule = match &cmd.paint {
-            crate::scene::layer::ShapePaint::SolidFill { fill_rule, .. } => *fill_rule,
-            crate::scene::layer::ShapePaint::GradientFill { fill_rule, .. } => *fill_rule,
-            _ => crate::geometry::path::FillRule::NonZero,
-        };
-        let opacity = match &cmd.paint {
-            crate::scene::layer::ShapePaint::SolidFill { opacity, .. } => *opacity,
-            crate::scene::layer::ShapePaint::GradientFill { opacity, .. } => *opacity,
-            _ => 1.0,
-        };
-
-        let vertex_start = fill_vertices.len() as u32;
-        let (verts, idxs) = lyon_fill_path(&path, color, paint_index, opacity, fill_rule, vertex_start);
-        fill_vertices.extend(verts);
-        fill_indices.extend(idxs);
+    if sprite_groups.is_empty() {
+        return EncodedPathData::empty();
     }
 
-    // ── Second pass: strokes (GPU compute) ──────────────────
-    // stroke first_vertex_idx is offset by fill_vertex_count so compute shader
-    // writes to the correct absolute position in the shared vertex buffer.
+    if batch_synced && transforms.len() > 1 {
+        encode_synced(sprite_groups, transforms.len() as u32)
+    } else {
+        encode_unsynced(sprite_groups)
+    }
+}
+
+/// Legacy single-sprite encode (no sprite_index needed, world transform pre-applied).
+/// Kept for the old single-sprite code path; sprite_index=0 for all vertices.
+pub fn encode_paths(commands: &[ShapeDrawCommand], _world_transform: &Mat2D) -> EncodedPathData {
+    let group = vec![(0u32, commands.to_vec())];
+    encode_paths_instanced(&group, &[Mat2D::identity()], false)
+}
+fn remap_local_draw(
+    draw: EncodedDraw,
+    fill_index_offset: u32,
+    stroke_index_offset: u32,
+    complex_index_offset: u32,
+) -> EncodedDraw {
+    match draw {
+        EncodedDraw::Simple {
+            source,
+            index_start,
+            index_count,
+        } => {
+            let base = match source {
+                SimpleDrawSource::Fill => fill_index_offset,
+                SimpleDrawSource::Stroke => stroke_index_offset,
+            };
+            EncodedDraw::Simple {
+                source,
+                index_start: index_start + base,
+                index_count,
+            }
+        }
+        EncodedDraw::Complex(mut draw) => {
+            draw.stencil_index_start += complex_index_offset;
+            draw.cover_index_start += complex_index_offset;
+            EncodedDraw::Complex(draw)
+        }
+    }
+}
+
+// ─── Synced path: tessellate once, copy N times ─────────────
+
+fn encode_synced(
+    sprite_groups: &[(u32, Vec<ShapeDrawCommand>)],
+    instance_count: u32,
+) -> EncodedPathData {
+    let (_base_idx, base_cmds) = &sprite_groups[0];
+
+    // Tessellate only sprite[0] — sprite_index is 0; the vertex shader will
+    // add instance_index to get the actual sprite transform index.
+    let (
+        base_verts,
+        base_indices,
+        base_complex_indices,
+        base_complex_draws,
+        base_ordered_draws,
+        base_fill_contours,
+        base_fill_cubics,
+        base_paints,
+        base_segs,
+        base_stroke_idx,
+        base_stroke_verts,
+    ) = tessellate_sprite_fills(base_cmds, 0);
+
+    // NO vertex copies — GPU instancing handles the N sprites.
+    // The vertex shader reads: sprite_transforms[vertex.sprite_index + instance_index]
+
+    let stroke_index_offset = base_indices.len() as u32;
+    let ordered_draws = base_ordered_draws
+        .into_iter()
+        .map(|draw| remap_local_draw(draw, 0, stroke_index_offset, 0))
+        .collect();
+
+    let paints = if base_paints.is_empty() {
+        vec![GpuPaint::default()]
+    } else {
+        base_paints
+    };
+
+    EncodedPathData {
+        fill_contours: base_fill_contours,
+        fill_cubics: base_fill_cubics,
+        fill_vertex_count: base_verts.len() as u32,
+        fill_vertices: base_verts,
+        fill_indices: base_indices,
+        complex_fill_indices: base_complex_indices,
+        complex_fill_draws: base_complex_draws,
+        ordered_draws,
+        segments: base_segs,
+        stroke_indices: base_stroke_idx,
+        stroke_vertex_count: base_stroke_verts,
+        paints,
+        instance_count,
+    }
+}
+
+// —— Unsynced path: concatenate all sprites —————————
+fn encode_unsynced(sprite_groups: &[(u32, Vec<ShapeDrawCommand>)]) -> EncodedPathData {
+    let mut fill_vertices: Vec<GpuVertex> = Vec::new();
+    let mut fill_indices: Vec<u32> = Vec::new();
+    let mut all_complex_fill_indices: Vec<u32> = Vec::new();
+    let mut all_complex_fill_draws: Vec<ComplexFillDraw> = Vec::new();
+    let mut all_fill_contours: Vec<GpuFillContour> = Vec::new();
+    let mut all_fill_cubics: Vec<GpuFillCubic> = Vec::new();
+    let mut all_paints: Vec<GpuPaint> = Vec::new();
+    let mut pending_strokes: Vec<(
+        Vec<GpuCubicSegment>,
+        Vec<u32>,
+        u32,
+        u32,
+        Vec<EncodedDraw>,
+        u32,
+        u32,
+    )> = Vec::new();
+
+    for (sprite_idx, cmds) in sprite_groups {
+        let paint_offset = all_paints.len() as u32;
+        let fill_vertex_offset = fill_vertices.len() as u32;
+        let fill_index_offset = fill_indices.len() as u32;
+
+        let (
+            mut sv,
+            si,
+            cfi,
+            mut cfd,
+            local_draws,
+            mut fill_contours,
+            fill_cubics,
+            sp,
+            segs,
+            s_idx,
+            s_vcnt,
+        ) = tessellate_sprite_fills(cmds, *sprite_idx);
+
+        for v in &mut sv {
+            v.paint_index += paint_offset;
+        }
+
+        for &idx in &si {
+            fill_indices.push(idx + fill_vertex_offset);
+        }
+
+        let complex_index_offset = all_complex_fill_indices.len() as u32;
+        for idx in cfi {
+            all_complex_fill_indices.push(idx + fill_vertex_offset);
+        }
+        for draw in &mut cfd {
+            draw.stencil_index_start += complex_index_offset;
+            draw.cover_index_start += complex_index_offset;
+        }
+        all_complex_fill_draws.extend(cfd);
+
+        let cubic_offset = all_fill_cubics.len() as u32;
+        for contour in &mut fill_contours {
+            contour.first_cubic += cubic_offset;
+            contour.first_vertex += fill_vertex_offset;
+            contour.paint_index += paint_offset;
+        }
+        all_fill_contours.extend(fill_contours);
+        all_fill_cubics.extend(fill_cubics);
+
+        let mut remapped_segs = segs;
+        for seg in &mut remapped_segs {
+            seg.paint_index += paint_offset;
+        }
+        pending_strokes.push((
+            remapped_segs,
+            s_idx,
+            s_vcnt,
+            sv.len() as u32,
+            local_draws,
+            fill_index_offset,
+            complex_index_offset,
+        ));
+
+        fill_vertices.extend(sv);
+        all_paints.extend(sp);
+    }
+
+    let total_fill_verts = fill_vertices.len() as u32;
+    let stroke_index_base = fill_indices.len() as u32;
+    let mut all_segs: Vec<GpuCubicSegment> = Vec::new();
+    let mut all_stroke_idx: Vec<u32> = Vec::new();
+    let mut total_stroke_verts: u32 = 0;
+    let mut all_ordered_draws: Vec<EncodedDraw> = Vec::new();
+    let mut stroke_base = total_fill_verts;
+
+    for (
+        mut segs,
+        idxs,
+        stroke_vert_count,
+        local_fill_count,
+        local_draws,
+        fill_index_offset,
+        complex_index_offset,
+    ) in pending_strokes
+    {
+        for seg in &mut segs {
+            seg.first_vertex_idx = stroke_base + (seg.first_vertex_idx - local_fill_count);
+        }
+
+        let stroke_index_offset = stroke_index_base + all_stroke_idx.len() as u32;
+        for idx in idxs {
+            all_stroke_idx.push(stroke_base + (idx - local_fill_count));
+        }
+
+        all_ordered_draws.extend(local_draws.into_iter().map(|draw| {
+            remap_local_draw(
+                draw,
+                fill_index_offset,
+                stroke_index_offset,
+                complex_index_offset,
+            )
+        }));
+
+        stroke_base += stroke_vert_count;
+        total_stroke_verts += stroke_vert_count;
+        all_segs.extend(segs);
+    }
+
+    if all_paints.is_empty() {
+        all_paints.push(GpuPaint::default());
+    }
+
+    EncodedPathData {
+        fill_contours: all_fill_contours,
+        fill_cubics: all_fill_cubics,
+        fill_vertex_count: fill_vertices.len() as u32,
+        fill_vertices,
+        fill_indices,
+        complex_fill_indices: all_complex_fill_indices,
+        complex_fill_draws: all_complex_fill_draws,
+        ordered_draws: all_ordered_draws,
+        segments: all_segs,
+        stroke_indices: all_stroke_idx,
+        stroke_vertex_count: total_stroke_verts,
+        paints: all_paints,
+        instance_count: 1,
+    }
+}
+
+// —— Single-sprite tessellation —————————————————————————
+/// Tessellate fills + strokes for one sprite's draw commands.
+/// Returns (fill_verts, fill_indices, paints, stroke_segs, stroke_indices, stroke_vert_count).
+/// All vertex positions are in LOCAL space.
+fn tessellate_sprite_fills(
+    commands: &[ShapeDrawCommand],
+    sprite_idx: u32,
+) -> (
+    Vec<GpuVertex>,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<ComplexFillDraw>,
+    Vec<EncodedDraw>,
+    Vec<GpuFillContour>,
+    Vec<GpuFillCubic>,
+    Vec<GpuPaint>,
+    Vec<GpuCubicSegment>,
+    Vec<u32>,
+    u32,
+) {
+    let mut fill_vertices: Vec<GpuVertex> = Vec::new();
+    let mut fill_indices: Vec<u32> = Vec::new();
+    let mut complex_fill_indices: Vec<u32> = Vec::new();
+    let mut complex_fill_draws: Vec<ComplexFillDraw> = Vec::new();
+    let mut ordered_draws: Vec<EncodedDraw> = Vec::new();
+    let mut fill_contours: Vec<GpuFillContour> = Vec::new();
+    let mut fill_cubics: Vec<GpuFillCubic> = Vec::new();
+    let mut paints: Vec<GpuPaint> = Vec::new();
+    let mut segments: Vec<GpuCubicSegment> = Vec::new();
+    let mut stroke_indices: Vec<u32> = Vec::new();
+    let mut stroke_vertex_cursor: u32 = 0;
+
+    // —— Fills (GPU edge tess + CPU topology) ———————————————
+    for cmd in commands {
+        let (color, is_stroke, _) = extract_paint_info(&cmd.paint);
+        if is_stroke {
+            continue;
+        }
+
+        let paint_index = paints.len() as u32;
+        paints.push(build_gpu_paint_local(&cmd.paint));
+
+        let fill_rule = match &cmd.paint {
+            ShapePaint::SolidFill { fill_rule, .. } => *fill_rule,
+            ShapePaint::GradientFill { fill_rule, .. } => *fill_rule,
+            _ => crate::geometry::path::FillRule::NonZero,
+        };
+        let contours = iter_contours(&cmd.path);
+        let contour_data = collect_fill_contours(&contours);
+        if contour_data.is_empty() {
+            continue;
+        }
+
+        let fill_index_start = fill_indices.len() as u32;
+        let complex_draw_start = complex_fill_draws.len();
+        let same_winding = contours_have_uniform_winding(&contour_data);
+        let all_fan_safe = contour_data.iter().all(|contour| contour.fan_safe);
+
+        if fill_rule == crate::geometry::path::FillRule::NonZero && same_winding && all_fan_safe {
+            encode_fill_midpoint_fans(
+                &contour_data,
+                color,
+                paint_index,
+                sprite_idx,
+                &mut fill_vertices,
+                &mut fill_indices,
+                &mut fill_contours,
+                &mut fill_cubics,
+            );
+            let index_count = fill_indices.len() as u32 - fill_index_start;
+            if index_count > 0 {
+                ordered_draws.push(EncodedDraw::Simple {
+                    source: SimpleDrawSource::Fill,
+                    index_start: fill_index_start,
+                    index_count,
+                });
+            }
+        } else {
+            encode_complex_fill(
+                &contour_data,
+                color,
+                paint_index,
+                sprite_idx,
+                fill_rule,
+                &mut fill_vertices,
+                &mut complex_fill_indices,
+                &mut complex_fill_draws,
+                &mut fill_contours,
+                &mut fill_cubics,
+            );
+            if complex_fill_draws.len() > complex_draw_start {
+                if let Some(draw) = complex_fill_draws.last().copied() {
+                    ordered_draws.push(EncodedDraw::Complex(draw));
+                }
+            }
+        }
+    }
+
+    // —— Strokes (GPU compute) ———————————————————————————————————
     let fill_count = fill_vertices.len() as u32;
 
     for cmd in commands {
         let (color, is_stroke, half_width) = extract_paint_info(&cmd.paint);
-        if !is_stroke { continue; }
+        if !is_stroke {
+            continue;
+        }
 
         let paint_index = paints.len() as u32;
-        paints.push(build_gpu_paint(&cmd.paint, world_transform));
+        paints.push(build_gpu_paint_local(&cmd.paint));
 
-        let path = cmd.path.transform(world_transform);
-
-        for contour in iter_contours(&path) {
-            if contour.cubics.is_empty() { continue; }
+        let stroke_index_start = stroke_indices.len() as u32;
+        for contour in iter_contours(&cmd.path) {
+            if contour.cubics.is_empty() {
+                continue;
+            }
             stroke_vertex_cursor = encode_stroke_contour(
-                &contour, color, half_width, paint_index,
+                &contour,
+                color,
+                half_width,
+                paint_index,
+                sprite_idx,
                 fill_count,
-                &mut segments, &mut stroke_indices,
+                &mut segments,
+                &mut stroke_indices,
                 stroke_vertex_cursor,
             );
         }
+
+        let index_count = stroke_indices.len() as u32 - stroke_index_start;
+        if index_count > 0 {
+            ordered_draws.push(EncodedDraw::Simple {
+                source: SimpleDrawSource::Stroke,
+                index_start: stroke_index_start,
+                index_count,
+            });
+        }
     }
 
-    if paints.is_empty() {
-        paints.push(GpuPaint::default());
-    }
-
-    EncodedPathData {
+    (
         fill_vertices,
         fill_indices,
+        complex_fill_indices,
+        complex_fill_draws,
+        ordered_draws,
+        fill_contours,
+        fill_cubics,
+        paints,
         segments,
         stroke_indices,
-        stroke_vertex_count: stroke_vertex_cursor,
-        paints,
+        stroke_vertex_cursor,
+    )
+}
+
+// —— Fill topology selection ———————————————————————————————
+
+
+#[derive(Clone)]
+struct ContourFillData {
+    contour: Contour,
+    samples: Vec<Vec2D>,
+    edge_samples: Vec<Vec2D>,
+    midpoint: Vec2D,
+    signed_area: f32,
+    fan_safe: bool,
+}
+
+const FILL_TOPOLOGY_NONE: u32 = 0;
+const FILL_TOPOLOGY_SIMPLE: u32 = 1;
+const FILL_TOPOLOGY_COMPLEX_FAN: u32 = 2;
+const FILL_TOPOLOGY_COMPLEX_GPU: u32 = 3;
+const MAX_GPU_COMPLEX_FILL_VERTS: u32 = 512;
+
+fn collect_fill_contours(contours: &[Contour]) -> Vec<ContourFillData> {
+    let mut result = Vec::new();
+
+    for contour in contours {
+        if !contour.closed || contour.cubics.is_empty() {
+            continue;
+        }
+
+        let samples = normalized_polygon(&contour_fill_samples(contour));
+        let edge_samples = normalized_polygon(&contour_edge_samples(contour));
+        if samples.len() < 3 || edge_samples.len() < 3 {
+            continue;
+        }
+
+        let signed_area = polygon_signed_area(&edge_samples);
+        if signed_area.abs() < 1e-3 {
+            continue;
+        }
+
+        let midpoint = contour_midpoint(contour);
+        let fan_safe = point_in_polygon(&samples, midpoint)
+            && point_in_polygon_kernel_approx(&samples, midpoint);
+
+        result.push(ContourFillData {
+            contour: contour.clone(),
+            samples,
+            edge_samples,
+            midpoint,
+            signed_area,
+            fan_safe,
+        });
+    }
+
+    result
+}
+
+fn contours_have_uniform_winding(contours: &[ContourFillData]) -> bool {
+    let mut winding_sign = 0.0f32;
+    for contour in contours {
+        let sign = contour.signed_area.signum();
+        if winding_sign == 0.0 {
+            winding_sign = sign;
+        } else if sign != winding_sign {
+            return false;
+        }
+    }
+    true
+}
+
+fn encode_fill_midpoint_fans(
+    contours: &[ContourFillData],
+    color: Color,
+    paint_index: u32,
+    sprite_index: u32,
+    fill_vertices: &mut Vec<GpuVertex>,
+    fill_indices: &mut Vec<u32>,
+    fill_contours: &mut Vec<GpuFillContour>,
+    fill_cubics: &mut Vec<GpuFillCubic>,
+) {
+    for contour in contours {
+        let Some((_, total_edge_verts, _)) = append_fill_contour_geometry(
+            contour,
+            color,
+            paint_index,
+            sprite_index,
+            fill_vertices,
+            fill_contours,
+            fill_cubics,
+        ) else {
+            continue;
+        };
+
+        if total_edge_verts < 3 {
+            continue;
+        }
+
+        let first_index = fill_indices.len() as u32;
+        fill_indices.resize(fill_indices.len() + total_edge_verts as usize * 3, 0);
+        if let Some(fill_contour) = fill_contours.last_mut() {
+            fill_contour.first_index = first_index;
+            fill_contour.simple_fill = FILL_TOPOLOGY_SIMPLE;
+        }
     }
 }
 
-// ─── Lyon fill tessellation ─────────────────────────────────
+fn encode_complex_fill(
+    contours: &[ContourFillData],
+    color: Color,
+    paint_index: u32,
+    sprite_index: u32,
+    fill_rule: crate::geometry::path::FillRule,
+    fill_vertices: &mut Vec<GpuVertex>,
+    complex_fill_indices: &mut Vec<u32>,
+    complex_fill_draws: &mut Vec<ComplexFillDraw>,
+    fill_contours: &mut Vec<GpuFillContour>,
+    fill_cubics: &mut Vec<GpuFillCubic>,
+) {
+    let stencil_index_start = complex_fill_indices.len() as u32;
+    let mut any_geometry = false;
+    let mut bounds = crate::geometry::math::AABB::empty();
 
-/// CPU fill tessellation using Lyon (correct for concave polygons).
+    for contour in contours {
+        for p in &contour.samples {
+            bounds.expand_to_include(*p);
+        }
+
+        let Some((first_vertex, total_edge_verts, midpoint_idx)) = append_fill_contour_geometry(
+            contour,
+            color,
+            paint_index,
+            sprite_index,
+            fill_vertices,
+            fill_contours,
+            fill_cubics,
+        ) else {
+            continue;
+        };
+
+        if total_edge_verts < 3 {
+            continue;
+        }
+
+        any_geometry = true;
+
+        let gpu_topology_mode = if contour.fan_safe {
+            Some(FILL_TOPOLOGY_COMPLEX_FAN)
+        } else if total_edge_verts <= MAX_GPU_COMPLEX_FILL_VERTS {
+            Some(FILL_TOPOLOGY_COMPLEX_GPU)
+        } else {
+            None
+        };
+
+        if let Some(topology_mode) = gpu_topology_mode {
+            let first_index = complex_fill_indices.len() as u32;
+            complex_fill_indices.resize(
+                complex_fill_indices.len() + total_edge_verts as usize * 3,
+                first_vertex,
+            );
+            if let Some(fill_contour) = fill_contours.last_mut() {
+                fill_contour.first_index = first_index;
+                fill_contour.simple_fill = topology_mode;
+            }
+            continue;
+        }
+
+        if !contour.fan_safe {
+            if let Some(indices) = cached_triangulate_polygon_indices(&contour.edge_samples) {
+                for idx in indices {
+                    complex_fill_indices.push(first_vertex + idx);
+                }
+                continue;
+            }
+        }
+
+        for i in 0..total_edge_verts {
+            let next = if i + 1 == total_edge_verts { 0 } else { i + 1 };
+            complex_fill_indices.push(midpoint_idx);
+            complex_fill_indices.push(first_vertex + i);
+            complex_fill_indices.push(first_vertex + next);
+        }
+    }
+
+    if !any_geometry || bounds.is_empty() {
+        return;
+    }
+
+    let cover_vertex_start = fill_vertices.len() as u32;
+    let cover_verts = [
+        [bounds.min_x, bounds.min_y],
+        [bounds.max_x, bounds.min_y],
+        [bounds.max_x, bounds.max_y],
+        [bounds.min_x, bounds.max_y],
+    ];
+    for pos in cover_verts {
+        fill_vertices.push(GpuVertex {
+            position: pos,
+            uv: [0.0, 0.0],
+            color: [color.r, color.g, color.b, color.a],
+            world_pos: [0.0, 0.0],
+            paint_index,
+            sprite_index,
+        });
+    }
+
+    let cover_index_start = complex_fill_indices.len() as u32;
+    complex_fill_indices.extend_from_slice(&[
+        cover_vertex_start,
+        cover_vertex_start + 1,
+        cover_vertex_start + 2,
+        cover_vertex_start,
+        cover_vertex_start + 2,
+        cover_vertex_start + 3,
+    ]);
+
+    complex_fill_draws.push(ComplexFillDraw {
+        stencil_index_start,
+        stencil_index_count: cover_index_start - stencil_index_start,
+        cover_index_start,
+        cover_index_count: 6,
+        fill_rule: match fill_rule {
+            crate::geometry::path::FillRule::EvenOdd => ComplexFillRule::EvenOdd,
+            crate::geometry::path::FillRule::NonZero => ComplexFillRule::NonZero,
+        },
+    });
+}
+
+fn append_fill_contour_geometry(
+    contour: &ContourFillData,
+    color: Color,
+    paint_index: u32,
+    sprite_index: u32,
+    fill_vertices: &mut Vec<GpuVertex>,
+    fill_contours: &mut Vec<GpuFillContour>,
+    fill_cubics: &mut Vec<GpuFillCubic>,
+) -> Option<(u32, u32, u32)> {
+    if contour.contour.cubics.is_empty() {
+        return None;
+    }
+
+    let first_vertex = fill_vertices.len() as u32;
+    let first_cubic = fill_cubics.len() as u32;
+
+    let mut total_edge_verts = 0u32;
+    for (i, cubic) in contour.contour.cubics.iter().enumerate() {
+        let seg_count =
+            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
+                .max(MIN_FILL_CUBIC_SEGMENTS);
+        total_edge_verts += if i == contour.contour.cubics.len() - 1 {
+            seg_count + 1
+        } else {
+            seg_count
+        };
+    }
+
+    if total_edge_verts < 3 {
+        return None;
+    }
+
+    fill_vertices.resize(
+        fill_vertices.len() + total_edge_verts as usize + 1,
+        GpuVertex::default(),
+    );
+
+    let mut edge_cursor = 0u32;
+    for (i, cubic) in contour.contour.cubics.iter().enumerate() {
+        let seg_count =
+            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
+                .max(MIN_FILL_CUBIC_SEGMENTS);
+        let edge_count = if i == contour.contour.cubics.len() - 1 {
+            seg_count + 1
+        } else {
+            seg_count
+        };
+        fill_cubics.push(GpuFillCubic {
+            p0: [cubic[0].x, cubic[0].y],
+            p1: [cubic[1].x, cubic[1].y],
+            p2: [cubic[2].x, cubic[2].y],
+            p3: [cubic[3].x, cubic[3].y],
+            segment_count: seg_count,
+            first_edge_vertex: edge_cursor,
+            _pad: [0; 2],
+        });
+        edge_cursor += edge_count;
+    }
+
+    let midpoint_idx = first_vertex + total_edge_verts;
+    fill_contours.push(GpuFillContour {
+        midpoint: [contour.midpoint.x, contour.midpoint.y],
+        first_cubic,
+        cubic_count: contour.contour.cubics.len() as u32,
+        first_vertex,
+        total_edge_verts,
+        first_index: 0,
+        simple_fill: FILL_TOPOLOGY_NONE,
+        color: [color.r, color.g, color.b, color.a],
+        paint_index,
+        sprite_index,
+        _pad1: [0; 2],
+    });
+
+    Some((first_vertex, total_edge_verts, midpoint_idx))
+}
+
+fn contour_fill_samples(contour: &Contour) -> Vec<Vec2D> {
+    let mut points = Vec::new();
+    if let Some(first) = contour.cubics.first() {
+        points.push(first[0]);
+    }
+
+    for cubic in &contour.cubics {
+        let seg_count =
+            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0).max(4);
+        for i in 1..=seg_count {
+            let t = i as f32 / seg_count as f32;
+            points.push(super::math::cubic_eval(
+                cubic[0], cubic[1], cubic[2], cubic[3], t,
+            ));
+        }
+    }
+
+    points
+}
+
+fn contour_edge_samples(contour: &Contour) -> Vec<Vec2D> {
+    let mut points = Vec::new();
+    if let Some(first) = contour.cubics.first() {
+        points.push(first[0]);
+    }
+
+    for cubic in &contour.cubics {
+        let seg_count =
+            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
+                .max(MIN_FILL_CUBIC_SEGMENTS);
+        for i in 1..=seg_count {
+            let t = i as f32 / seg_count as f32;
+            points.push(super::math::cubic_eval(
+                cubic[0], cubic[1], cubic[2], cubic[3], t,
+            ));
+        }
+    }
+
+    points
+}
+
+fn normalized_polygon(samples: &[Vec2D]) -> Vec<Vec2D> {
+    let mut polygon = samples.to_vec();
+    if polygon.len() >= 2 {
+        let first = polygon[0];
+        let last = polygon[polygon.len() - 1];
+        if first.distance(last) <= 1e-3 {
+            polygon.pop();
+        }
+    }
+    polygon
+}
+
+fn contour_midpoint(contour: &Contour) -> Vec2D {
+    if contour.cubics.is_empty() {
+        return Vec2D::ZERO;
+    }
+
+    let mut endpoints_sum = Vec2D::ZERO;
+    for cubic in &contour.cubics {
+        endpoints_sum = endpoints_sum + cubic[3];
+    }
+    endpoints_sum * (1.0 / contour.cubics.len() as f32)
+}
+
+fn point_in_polygon_kernel_approx(points: &[Vec2D], p: Vec2D) -> bool {
+    for &target in points {
+        if !segment_stays_inside_polygon(points, p, target) {
+            return false;
+        }
+    }
+    true
+}
+
+fn segment_stays_inside_polygon(points: &[Vec2D], a: Vec2D, b: Vec2D) -> bool {
+    for step in 1..16 {
+        let t = step as f32 / 16.0;
+        let sample = a.lerp(b, t);
+        if !point_in_polygon(points, sample) {
+            return false;
+        }
+    }
+    true
+}
+
+fn cached_triangulate_polygon_indices(points: &[Vec2D]) -> Option<Vec<u32>> {
+    let key = polygon_cache_key(points);
+    let cache = triangulation_cache();
+
+    if let Some(cached) = cache.lock().ok()?.get(&key).cloned() {
+        return Some(cached);
+    }
+
+    let indices = triangulate_polygon_indices(points)?;
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 512 {
+            guard.clear();
+        }
+        guard.insert(key, indices.clone());
+    }
+
+    Some(indices)
+}
+
+fn triangulation_cache() -> &'static Mutex<HashMap<u64, Vec<u32>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<u32>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn polygon_cache_key(points: &[Vec2D]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    points.len().hash(&mut hasher);
+    for p in points {
+        p.x.to_bits().hash(&mut hasher);
+        p.y.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn triangulate_polygon_indices(points: &[Vec2D]) -> Option<Vec<u32>> {
+    let mut remaining = simplified_polygon_indices(points);
+    if remaining.len() < 3 {
+        return None;
+    }
+
+    let area = polygon_signed_area_by_indices(points, &remaining);
+    if area.abs() < 1e-3 {
+        return None;
+    }
+
+    let is_ccw = area > 0.0;
+    let mut indices = Vec::with_capacity((remaining.len() - 2) * 3);
+    let mut guard = remaining.len() * remaining.len();
+
+    while remaining.len() > 3 && guard > 0 {
+        guard -= 1;
+        let mut ear_found = false;
+
+        for i in 0..remaining.len() {
+            let prev = remaining[(i + remaining.len() - 1) % remaining.len()];
+            let curr = remaining[i];
+            let next = remaining[(i + 1) % remaining.len()];
+
+            if !is_polygon_ear(points, prev, curr, next, &remaining, is_ccw) {
+                continue;
+            }
+
+            indices.extend_from_slice(&[prev as u32, curr as u32, next as u32]);
+            remaining.remove(i);
+            ear_found = true;
+            break;
+        }
+
+        if !ear_found {
+            return None;
+        }
+    }
+
+    if remaining.len() == 3 {
+        indices.extend_from_slice(&[
+            remaining[0] as u32,
+            remaining[1] as u32,
+            remaining[2] as u32,
+        ]);
+    }
+
+    Some(indices)
+}
+
+fn simplified_polygon_indices(points: &[Vec2D]) -> Vec<usize> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+
+    let mut filtered = Vec::with_capacity(points.len());
+    for i in 0..points.len() {
+        let prev = points[(i + points.len() - 1) % points.len()];
+        let curr = points[i];
+        if curr.distance(prev) > 1e-3 {
+            filtered.push(i);
+        }
+    }
+
+    let mut changed = true;
+    while changed && filtered.len() > 3 {
+        changed = false;
+        for i in 0..filtered.len() {
+            let prev = points[filtered[(i + filtered.len() - 1) % filtered.len()]];
+            let curr = points[filtered[i]];
+            let next = points[filtered[(i + 1) % filtered.len()]];
+            if triangle_cross(prev, curr, next).abs() <= 1e-4 {
+                filtered.remove(i);
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    filtered
+}
+
+fn polygon_signed_area_by_indices(points: &[Vec2D], indices: &[usize]) -> f32 {
+    if indices.len() < 3 {
+        return 0.0;
+    }
+
+    let mut area = 0.0f32;
+    for i in 0..indices.len() {
+        let p0 = points[indices[i]];
+        let p1 = points[indices[(i + 1) % indices.len()]];
+        area += p0.cross(p1);
+    }
+    area * 0.5
+}
+
+fn is_polygon_ear(
+    points: &[Vec2D],
+    prev: usize,
+    curr: usize,
+    next: usize,
+    remaining: &[usize],
+    is_ccw: bool,
+) -> bool {
+    let a = points[prev];
+    let b = points[curr];
+    let c = points[next];
+    let cross = triangle_cross(a, b, c);
+
+    if is_ccw {
+        if cross <= 1e-5 {
+            return false;
+        }
+    } else if cross >= -1e-5 {
+        return false;
+    }
+
+    for &idx in remaining {
+        if idx == prev || idx == curr || idx == next {
+            continue;
+        }
+
+        if point_in_triangle(points[idx], a, b, c) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn triangle_cross(a: Vec2D, b: Vec2D, c: Vec2D) -> f32 {
+    (b - a).cross(c - a)
+}
+
+fn point_in_triangle(p: Vec2D, a: Vec2D, b: Vec2D, c: Vec2D) -> bool {
+    let ab = triangle_cross(a, b, p);
+    let bc = triangle_cross(b, c, p);
+    let ca = triangle_cross(c, a, p);
+    let has_neg = ab < -1e-5 || bc < -1e-5 || ca < -1e-5;
+    let has_pos = ab > 1e-5 || bc > 1e-5 || ca > 1e-5;
+    !(has_neg && has_pos)
+}
+
+fn polygon_signed_area(points: &[Vec2D]) -> f32 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+
+    let mut area = 0.0f32;
+    for i in 0..points.len() {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % points.len()];
+        area += p0.cross(p1);
+    }
+    area * 0.5
+}
+
+fn polygon_centroid(points: &[Vec2D]) -> Vec2D {
+    let area = polygon_signed_area(points);
+    if area.abs() < 1e-5 {
+        let mut sum = Vec2D::ZERO;
+        for p in points {
+            sum = sum + *p;
+        }
+        return sum * (1.0 / points.len().max(1) as f32);
+    }
+
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for i in 0..points.len() {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % points.len()];
+        let cross = p0.cross(p1);
+        cx += (p0.x + p1.x) * cross;
+        cy += (p0.y + p1.y) * cross;
+    }
+    let factor = 1.0 / (6.0 * area);
+    Vec2D::new(cx * factor, cy * factor)
+}
+
+fn point_in_polygon(points: &[Vec2D], p: Vec2D) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let pi = points[i];
+        let pj = points[j];
+        let dy = pj.y - pi.y;
+        let denom = if dy.abs() < 1e-6 {
+            if dy.is_sign_negative() {
+                -1e-6
+            } else {
+                1e-6
+            }
+        } else {
+            dy
+        };
+        let intersects =
+            ((pi.y > p.y) != (pj.y > p.y)) && (p.x < (pj.x - pi.x) * (p.y - pi.y) / denom + pi.x);
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Rive-quality tessellation tolerance: 1/4 pixel (kParametricPrecision = 4).
+/// This matches Rive's parametric precision and produces smooth curves for
+/// small shapes like eyes, circles, and rounded corners.
+const FILL_TOLERANCE: f32 = 0.25;
+const MIN_FILL_CUBIC_SEGMENTS: u32 = 2;
+
+#[allow(dead_code)]
 fn lyon_fill_path(
     path: &RawPath,
     color: Color,
@@ -215,10 +1336,13 @@ fn lyon_fill_path(
     opacity: f32,
     fill_rule: crate::geometry::path::FillRule,
     vertex_start: u32,
+    sprite_idx: u32,
 ) -> (Vec<GpuVertex>, Vec<u32>) {
-    use lyon::path::Path;
     use lyon::math::point;
-    use lyon::tessellation::{FillTessellator, FillOptions, VertexBuffers, BuffersBuilder, FillVertex};
+    use lyon::path::Path;
+    use lyon::tessellation::{
+        BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers,
+    };
 
     let mut builder = Path::builder();
     let mut point_idx = 0;
@@ -250,11 +1374,7 @@ fn lyon_fill_path(
                 let c1 = path.points[point_idx];
                 let c2 = path.points[point_idx + 1];
                 let e = path.points[point_idx + 2];
-                builder.cubic_bezier_to(
-                    point(c1.x, c1.y),
-                    point(c2.x, c2.y),
-                    point(e.x, e.y),
-                );
+                builder.cubic_bezier_to(point(c1.x, c1.y), point(c2.x, c2.y), point(e.x, e.y));
                 point_idx += 3;
             }
             PathVerb::Close => {
@@ -291,21 +1411,23 @@ fn lyon_fill_path(
                 position: [pos.x, pos.y],
                 uv: [0.0, 0.0],
                 color: [r, g, b, a],
-                world_pos: [pos.x, pos.y],
+                world_pos: [0.0, 0.0], // computed in vertex shader
                 paint_index,
-                _pad: 0,
+                sprite_index: sprite_idx,
             }
         });
         let _ = tessellator.tessellate_path(
             &lyon_path,
             &FillOptions::default()
                 .with_fill_rule(lyon_rule)
-                .with_tolerance(0.5),
+                .with_tolerance(FILL_TOLERANCE),
             &mut buf_builder,
         );
     }
 
-    let indices: Vec<u32> = geometry.indices.iter()
+    let indices: Vec<u32> = geometry
+        .indices
+        .iter()
         .map(|&i| i as u32 + vertex_start)
         .collect();
 
@@ -314,6 +1436,7 @@ fn lyon_fill_path(
 
 // ─── Contour extraction ─────────────────────────────────────
 
+#[derive(Clone)]
 struct Contour {
     cubics: Vec<[Vec2D; 4]>,
     closed: bool,
@@ -330,7 +1453,10 @@ fn iter_contours(path: &RawPath) -> Vec<Contour> {
         match verb {
             PathVerb::Move => {
                 if !cubics.is_empty() {
-                    contours.push(Contour { cubics: std::mem::take(&mut cubics), closed: false });
+                    contours.push(Contour {
+                        cubics: std::mem::take(&mut cubics),
+                        closed: false,
+                    });
                 }
                 current_pos = path.points[point_idx];
                 move_pos = current_pos;
@@ -375,45 +1501,49 @@ fn iter_contours(path: &RawPath) -> Vec<Contour> {
                     current_pos = move_pos;
                 }
                 if !cubics.is_empty() {
-                    contours.push(Contour { cubics: std::mem::take(&mut cubics), closed: true });
+                    contours.push(Contour {
+                        cubics: std::mem::take(&mut cubics),
+                        closed: true,
+                    });
                 }
             }
         }
     }
 
     if !cubics.is_empty() {
-        contours.push(Contour { cubics, closed: false });
+        contours.push(Contour {
+            cubics,
+            closed: false,
+        });
     }
 
     contours
 }
 
-// ─── Stroke encoding (offset quad strip, GPU compute) ───────
+// ─── Stroke encoding ─────────────────────────────────────────
 
-/// Encode a stroked contour as GPU compute segments.
-/// `fill_count` is the absolute fill vertex offset in the shared buffer.
 fn encode_stroke_contour(
     contour: &Contour,
     color: Color,
     half_width: f32,
     paint_index: u32,
-    fill_count: u32,        // absolute offset for fill region
+    sprite_index: u32,
+    fill_count: u32,
     segments: &mut Vec<GpuCubicSegment>,
     indices: &mut Vec<u32>,
-    mut stroke_vertex_cursor: u32,  // relative stroke cursor
+    mut stroke_vertex_cursor: u32,
 ) -> u32 {
     let strip_start = stroke_vertex_cursor;
     let mut total_pairs: u32 = 0;
 
     for (i, cubic) in contour.cubics.iter().enumerate() {
-        let seg_count = wang_cubic_segment_count(
-            cubic[0], cubic[1], cubic[2], cubic[3], 1.0,
-        ).max(1);
+        let seg_count =
+            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
+                .max(1);
 
         let is_last = i == contour.cubics.len() - 1;
         let num_new = if is_last { seg_count + 1 } else { seg_count };
 
-        // Absolute vertex buffer position = fill_count + stroke_vertex_cursor
         segments.push(GpuCubicSegment {
             p0: [cubic[0].x, cubic[0].y],
             p1: [cubic[1].x, cubic[1].y],
@@ -425,7 +1555,8 @@ fn encode_stroke_contour(
             first_vertex_idx: fill_count + stroke_vertex_cursor,
             flags: 1 | if is_last { 2 } else { 0 },
             paint_index,
-            _pad: [0; 3],
+            sprite_index,
+            _pad: [0; 2],
         });
         stroke_vertex_cursor += num_new;
 
@@ -440,14 +1571,14 @@ fn encode_stroke_contour(
             first_vertex_idx: fill_count + stroke_vertex_cursor,
             flags: 1 | if is_last { 2 } else { 0 },
             paint_index,
-            _pad: [0; 3],
+            sprite_index,
+            _pad: [0; 2],
         });
         stroke_vertex_cursor += num_new;
 
         total_pairs += num_new;
     }
 
-    // Quad-strip indices into stroke region (absolute: fill_count + relative)
     if total_pairs >= 2 {
         for i in 0..total_pairs - 1 {
             let base = fill_count + strip_start;
@@ -459,7 +1590,6 @@ fn encode_stroke_contour(
             indices.push(l0);
             indices.push(r0);
             indices.push(l1);
-
             indices.push(r0);
             indices.push(r1);
             indices.push(l1);
@@ -471,10 +1601,13 @@ fn encode_stroke_contour(
 
 // ─── Paint helpers ──────────────────────────────────────────
 
+use crate::lottie::model::{GradientColors, GradientType};
 use crate::scene::layer::ShapePaint;
-use crate::lottie::model::{GradientType, GradientColors};
 
-fn build_gpu_paint(paint: &ShapePaint, world_transform: &Mat2D) -> GpuPaint {
+/// Build a GPU paint from a ShapePaint.
+/// Gradient coordinates are stored in LOCAL space; the fragment shader
+/// will transform them to world space via sprite_transforms[sprite_index].
+fn build_gpu_paint_local(paint: &ShapePaint) -> GpuPaint {
     match paint {
         ShapePaint::SolidFill { color, opacity, .. } => {
             let mut p = GpuPaint::default();
@@ -490,22 +1623,31 @@ fn build_gpu_paint(paint: &ShapePaint, world_transform: &Mat2D) -> GpuPaint {
             p.stop_colors[0] = [color.r, color.g, color.b, color.a];
             p
         }
-        ShapePaint::GradientFill { gradient_type, start, end, colors, opacity, .. } => {
-            build_gradient_paint(*gradient_type, *start, *end, colors, *opacity, world_transform)
-        }
-        ShapePaint::GradientStroke { gradient_type, start, end, colors, opacity, .. } => {
-            build_gradient_paint(*gradient_type, *start, *end, colors, *opacity, world_transform)
-        }
+        ShapePaint::GradientFill {
+            gradient_type,
+            start,
+            end,
+            colors,
+            opacity,
+            ..
+        } => build_gradient_paint_local(*gradient_type, *start, *end, colors, *opacity),
+        ShapePaint::GradientStroke {
+            gradient_type,
+            start,
+            end,
+            colors,
+            opacity,
+            ..
+        } => build_gradient_paint_local(*gradient_type, *start, *end, colors, *opacity),
     }
 }
 
-fn build_gradient_paint(
+fn build_gradient_paint_local(
     gradient_type: GradientType,
     start: Vec2D,
     end: Vec2D,
     colors: &GradientColors,
     opacity: f32,
-    world_transform: &Mat2D,
 ) -> GpuPaint {
     let mut p = GpuPaint::default();
     p.paint_type = match gradient_type {
@@ -513,11 +1655,9 @@ fn build_gradient_paint(
         GradientType::Radial => 2,
     };
     p.opacity = opacity;
-
-    let ws = world_transform.transform_point(start);
-    let we = world_transform.transform_point(end);
-    p.grad_start = [ws.x, ws.y];
-    p.grad_end = [we.x, we.y];
+    // Keep in LOCAL space — vertex/fragment shader applies sprite_transforms[sprite_index]
+    p.grad_start = [start.x, start.y];
+    p.grad_end = [end.x, end.y];
 
     let count = colors.color_count.min(MAX_GRADIENT_STOPS);
     p.stop_count = count as u32;
@@ -547,15 +1687,21 @@ fn build_gradient_paint(
 }
 
 fn sample_opacity_stops(data: &[f32], count: usize, pos: f32) -> f32 {
-    if count == 0 || data.len() < 2 { return 1.0; }
+    if count == 0 || data.len() < 2 {
+        return 1.0;
+    }
 
     let first_off = data[0];
     let first_a = data[1];
-    if pos <= first_off { return first_a; }
+    if pos <= first_off {
+        return first_a;
+    }
 
     let last_off = data[(count - 1) * 2];
     let last_a = data[(count - 1) * 2 + 1];
-    if pos >= last_off { return last_a; }
+    if pos >= last_off {
+        return last_a;
+    }
 
     for i in 0..count - 1 {
         let o0 = data[i * 2];
@@ -563,7 +1709,11 @@ fn sample_opacity_stops(data: &[f32], count: usize, pos: f32) -> f32 {
         let o1 = data[(i + 1) * 2];
         let a1 = data[(i + 1) * 2 + 1];
         if pos >= o0 && pos <= o1 {
-            let t = if (o1 - o0) > 1e-6 { (pos - o0) / (o1 - o0) } else { 0.0 };
+            let t = if (o1 - o0) > 1e-6 {
+                (pos - o0) / (o1 - o0)
+            } else {
+                0.0
+            };
             return a0 + (a1 - a0) * t;
         }
     }
@@ -573,12 +1723,13 @@ fn sample_opacity_stops(data: &[f32], count: usize, pos: f32) -> f32 {
 
 fn extract_paint_info(paint: &ShapePaint) -> (Color, bool, f32) {
     match paint {
-        ShapePaint::SolidFill { color, opacity, .. } => {
-            (color.with_opacity(*opacity), false, 0.0)
-        }
-        ShapePaint::SolidStroke { color, opacity, width, .. } => {
-            (color.with_opacity(*opacity), true, *width * 0.5)
-        }
+        ShapePaint::SolidFill { color, opacity, .. } => (color.with_opacity(*opacity), false, 0.0),
+        ShapePaint::SolidStroke {
+            color,
+            opacity,
+            width,
+            ..
+        } => (color.with_opacity(*opacity), true, *width * 0.5),
         ShapePaint::GradientFill { opacity, .. } => {
             (Color::WHITE.with_opacity(*opacity), false, 0.0)
         }
@@ -587,3 +1738,137 @@ fn extract_paint_info(paint: &ShapePaint) -> (Color, bool, f32) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::path::FillRule;
+    use crate::lottie::model::BlendMode;
+    use crate::scene::layer::{ShapeDrawCommand, ShapePaint};
+    use std::mem::{offset_of, size_of};
+
+    fn solid_fill(path: RawPath) -> ShapeDrawCommand {
+        ShapeDrawCommand {
+            path,
+            paint: ShapePaint::SolidFill {
+                color: Color::WHITE,
+                opacity: 1.0,
+                fill_rule: FillRule::NonZero,
+            },
+            blend_mode: BlendMode::Normal,
+            sprite_index: 0,
+        }
+    }
+
+    fn concave_path() -> RawPath {
+        let mut path = RawPath::new();
+        path.move_to(0.0, 0.0);
+        path.line_to(4.0, 0.0);
+        path.line_to(4.0, 2.0);
+        path.line_to(2.0, 1.0);
+        path.line_to(4.0, 4.0);
+        path.line_to(0.0, 4.0);
+        path.close();
+        path
+    }
+
+    #[test]
+    fn gpu_fill_contour_layout_matches_wgsl() {
+        assert_eq!(size_of::<GpuFillContour>(), 64);
+        assert_eq!(offset_of!(GpuFillContour, midpoint), 0);
+        assert_eq!(offset_of!(GpuFillContour, first_cubic), 8);
+        assert_eq!(offset_of!(GpuFillContour, cubic_count), 12);
+        assert_eq!(offset_of!(GpuFillContour, first_vertex), 16);
+        assert_eq!(offset_of!(GpuFillContour, total_edge_verts), 20);
+        assert_eq!(offset_of!(GpuFillContour, first_index), 24);
+        assert_eq!(offset_of!(GpuFillContour, simple_fill), 28);
+        assert_eq!(offset_of!(GpuFillContour, color), 32);
+        assert_eq!(offset_of!(GpuFillContour, paint_index), 48);
+        assert_eq!(offset_of!(GpuFillContour, sprite_index), 52);
+        assert_eq!(offset_of!(GpuFillContour, _pad1), 56);
+    }
+
+    #[test]
+    fn gpu_struct_sizes_match_shader_expectations() {
+        assert_eq!(size_of::<GpuVertex>(), 48);
+        assert_eq!(size_of::<GpuCubicSegment>(), 80);
+        assert_eq!(size_of::<GpuFillCubic>(), 48);
+        assert_eq!(size_of::<GpuPaint>(), 352);
+        assert_eq!(size_of::<SpriteTransform>(), 32);
+        assert_eq!(size_of::<TessellateUniforms>(), 16);
+        assert_eq!(size_of::<FillTessUniforms>(), 16);
+    }
+
+    #[test]
+    fn rejects_concave_polygon_as_fan_safe() {
+        let polygon = vec![
+            Vec2D::new(0.0, 0.0),
+            Vec2D::new(4.0, 0.0),
+            Vec2D::new(4.0, 2.0),
+            Vec2D::new(2.0, 1.0),
+            Vec2D::new(4.0, 4.0),
+            Vec2D::new(0.0, 4.0),
+        ];
+
+        let midpoint = Vec2D::new(2.3333333, 1.8333334);
+        assert!(point_in_polygon(&polygon, midpoint));
+        assert!(!point_in_polygon_kernel_approx(&polygon, midpoint));
+    }
+
+    #[test]
+    fn triangulates_concave_polygon() {
+        let polygon = vec![
+            Vec2D::new(0.0, 0.0),
+            Vec2D::new(4.0, 0.0),
+            Vec2D::new(4.0, 2.0),
+            Vec2D::new(2.0, 1.0),
+            Vec2D::new(4.0, 4.0),
+            Vec2D::new(0.0, 4.0),
+        ];
+
+        let indices =
+            triangulate_polygon_indices(&polygon).expect("concave polygon should triangulate");
+        assert_eq!(indices.len(), 12);
+    }
+
+    #[test]
+    fn preserves_draw_order_across_simple_and_complex_fills() {
+        let mut simple = RawPath::new();
+        simple.add_rect(10.0, 10.0, 12.0, 12.0);
+
+        let encoded = encode_paths_instanced(
+            &[(0, vec![solid_fill(concave_path()), solid_fill(simple.clone())])],
+            &[Mat2D::identity()],
+            false,
+        );
+
+        assert_eq!(encoded.ordered_draws.len(), 2);
+        assert!(matches!(encoded.ordered_draws[0], EncodedDraw::Complex(_)));
+        assert!(matches!(
+            encoded.ordered_draws[1],
+            EncodedDraw::Simple {
+                source: SimpleDrawSource::Fill,
+                index_count,
+                ..
+            } if index_count > 0
+        ));
+
+        let reversed = encode_paths_instanced(
+            &[(0, vec![solid_fill(simple), solid_fill(concave_path())])],
+            &[Mat2D::identity()],
+            false,
+        );
+
+        assert_eq!(reversed.ordered_draws.len(), 2);
+        assert!(matches!(
+            reversed.ordered_draws[0],
+            EncodedDraw::Simple {
+                source: SimpleDrawSource::Fill,
+                index_count,
+                ..
+            } if index_count > 0
+        ));
+        assert!(matches!(reversed.ordered_draws[1], EncodedDraw::Complex(_)));
+    }
+}
+

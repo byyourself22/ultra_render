@@ -1,7 +1,7 @@
+use super::animation::AnimationPlayer;
+use super::layer::SceneLayer;
 use crate::geometry::math::Mat2D;
 use crate::lottie::model::LottieComposition;
-use super::layer::SceneLayer;
-use super::animation::AnimationPlayer;
 
 /// Root scene composition — the runtime representation of a Lottie animation
 #[derive(Clone, Debug)]
@@ -16,7 +16,9 @@ pub struct SceneComposition {
 impl SceneComposition {
     /// Create a scene from a parsed Lottie composition
     pub fn from_lottie(comp: &LottieComposition) -> Self {
-        let mut layers: Vec<SceneLayer> = comp.layers.iter()
+        let mut layers: Vec<SceneLayer> = comp
+            .layers
+            .iter()
             .map(|l| SceneLayer::from_lottie(l))
             .collect();
 
@@ -25,7 +27,9 @@ impl SceneComposition {
             if let Some(ref_id) = &layer.ref_id {
                 if let Some(asset) = comp.assets.iter().find(|a| a.id == *ref_id) {
                     if !asset.is_image {
-                        layer.children = asset.layers.iter()
+                        layer.children = asset
+                            .layers
+                            .iter()
                             .map(|l| SceneLayer::from_lottie(l))
                             .collect();
                     }
@@ -71,16 +75,23 @@ impl SceneComposition {
     }
 }
 
-fn update_layer_transforms(layers: &mut [SceneLayer], frame: f32, parent_world: &Mat2D, parent_opacity: f32) {
+fn update_layer_transforms(
+    layers: &mut [SceneLayer],
+    frame: f32,
+    parent_world: &Mat2D,
+    parent_opacity: f32,
+) {
     // Build parent index map for resolving hierarchy
-    let parent_transforms: Vec<(Option<i32>, Mat2D, f32)> = layers.iter()
+    let parent_transforms: Vec<(Option<i32>, Mat2D, f32)> = layers
+        .iter()
         .map(|l| (l.index, l.computed.world, l.computed.opacity))
         .collect();
 
     for i in 0..layers.len() {
         let parent_idx = layers[i].parent_index;
         let (world, opacity) = if let Some(pid) = parent_idx {
-            parent_transforms.iter()
+            parent_transforms
+                .iter()
                 .find(|(idx, _, _)| *idx == Some(pid))
                 .map(|(_, w, o)| (*w, *o))
                 .unwrap_or((*parent_world, parent_opacity))
@@ -99,7 +110,11 @@ fn update_layer_transforms(layers: &mut [SceneLayer], frame: f32, parent_world: 
     }
 }
 
-fn collect_layer_draws(layers: &[SceneLayer], frame: f32, commands: &mut Vec<super::layer::ShapeDrawCommand>) {
+fn collect_layer_draws(
+    layers: &[SceneLayer],
+    frame: f32,
+    commands: &mut Vec<super::layer::ShapeDrawCommand>,
+) {
     // Iterate in reverse order (Lottie layers are ordered back-to-front)
     for layer in layers.iter().rev() {
         if !layer.is_visible_at(frame) {

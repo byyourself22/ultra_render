@@ -1,12 +1,12 @@
-use serde_json::Value;
-use crate::geometry::math::{Vec2D, Color};
-use crate::geometry::path::{FillRule, StrokeCap, StrokeJoin};
 use super::model::*;
+use crate::geometry::math::{Color, Vec2D};
+use crate::geometry::path::{FillRule, StrokeCap, StrokeJoin};
+use serde_json::Value;
 
 /// Parse a Lottie JSON string into a LottieComposition
 pub fn parse_lottie(json_str: &str) -> Result<LottieComposition, String> {
-    let root: Value = serde_json::from_str(json_str)
-        .map_err(|e| format!("JSON parse error: {}", e))?;
+    let root: Value =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {}", e))?;
     parse_composition(&root)
 }
 
@@ -41,43 +41,51 @@ pub fn parse_composition(root: &Value) -> Result<LottieComposition, String> {
 }
 
 fn parse_assets(val: &Value) -> Vec<LottieAsset> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
-    arr.iter().map(|a| {
-        let id = a["id"].as_str().unwrap_or("").to_string();
-        let name = a["nm"].as_str().unwrap_or("").to_string();
-        let width = a["w"].as_f64().map(|v| v as f32);
-        let height = a["h"].as_f64().map(|v| v as f32);
-        let path = a["u"].as_str().map(|s| s.to_string());
-        let filename = a["p"].as_str().map(|s| s.to_string());
-        let is_image = filename.is_some() && !a.get("layers").is_some();
-        let layers = parse_layers(&a["layers"]);
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|a| {
+            let id = a["id"].as_str().unwrap_or("").to_string();
+            let name = a["nm"].as_str().unwrap_or("").to_string();
+            let width = a["w"].as_f64().map(|v| v as f32);
+            let height = a["h"].as_f64().map(|v| v as f32);
+            let path = a["u"].as_str().map(|s| s.to_string());
+            let filename = a["p"].as_str().map(|s| s.to_string());
+            let is_image = filename.is_some() && !a.get("layers").is_some();
+            let layers = parse_layers(&a["layers"]);
 
-        LottieAsset {
-            id,
-            name,
-            layers,
-            width,
-            height,
-            path,
-            filename,
-            is_image,
-        }
-    }).collect()
+            LottieAsset {
+                id,
+                name,
+                layers,
+                width,
+                height,
+                path,
+                filename,
+                is_image,
+            }
+        })
+        .collect()
 }
 
 fn parse_markers(val: &Value) -> Vec<LottieMarker> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
-    arr.iter().map(|m| {
-        LottieMarker {
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|m| LottieMarker {
             name: m["cm"].as_str().unwrap_or("").to_string(),
             time: m["tm"].as_f64().unwrap_or(0.0) as f32,
             duration: m["dr"].as_f64().unwrap_or(0.0) as f32,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 fn parse_layers(val: &Value) -> Vec<LottieLayer> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
     arr.iter().map(|l| parse_layer(l)).collect()
 }
 
@@ -188,29 +196,32 @@ fn parse_animated_f32_with_default(val: &Value, default: f32) -> AnimatedValue<f
         return AnimatedValue::Static(default);
     };
 
-    let keyframes = arr.iter().filter_map(|kf| {
-        let time = kf["t"].as_f64()? as f32;
-        let value = extract_f32_from_keyframe_value(&kf["s"], default);
-        let end_value = if kf.get("e").is_some() {
-            Some(extract_f32_from_keyframe_value(&kf["e"], default))
-        } else {
-            None
-        };
-        let hold = kf["h"].as_i64().unwrap_or(0) != 0;
-        let easing_in = parse_easing_handle(&kf["i"]);
-        let easing_out = parse_easing_handle(&kf["o"]);
+    let keyframes = arr
+        .iter()
+        .filter_map(|kf| {
+            let time = kf["t"].as_f64()? as f32;
+            let value = extract_f32_from_keyframe_value(&kf["s"], default);
+            let end_value = if kf.get("e").is_some() {
+                Some(extract_f32_from_keyframe_value(&kf["e"], default))
+            } else {
+                None
+            };
+            let hold = kf["h"].as_i64().unwrap_or(0) != 0;
+            let easing_in = parse_easing_handle(&kf["i"]);
+            let easing_out = parse_easing_handle(&kf["o"]);
 
-        Some(Keyframe {
-            time,
-            value,
-            end_value,
-            easing_in,
-            easing_out,
-            hold,
-            tan_in: None,
-            tan_out: None,
+            Some(Keyframe {
+                time,
+                value,
+                end_value,
+                easing_in,
+                easing_out,
+                hold,
+                tan_in: None,
+                tan_out: None,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     if keyframes.is_empty() {
         AnimatedValue::Static(default)
@@ -240,32 +251,35 @@ fn parse_animated_vec2d_with_default(val: &Value, default: Vec2D) -> AnimatedVal
         return AnimatedValue::Static(default);
     };
 
-    let keyframes = arr.iter().filter_map(|kf| {
-        let time = kf["t"].as_f64()? as f32;
-        let value = extract_vec2d_from_arr(&kf["s"], default);
-        let end_value = if kf.get("e").is_some() {
-            Some(extract_vec2d_from_arr(&kf["e"], default))
-        } else {
-            None
-        };
-        let hold = kf["h"].as_i64().unwrap_or(0) != 0;
-        let easing_in = parse_easing_handle(&kf["i"]);
-        let easing_out = parse_easing_handle(&kf["o"]);
+    let keyframes = arr
+        .iter()
+        .filter_map(|kf| {
+            let time = kf["t"].as_f64()? as f32;
+            let value = extract_vec2d_from_arr(&kf["s"], default);
+            let end_value = if kf.get("e").is_some() {
+                Some(extract_vec2d_from_arr(&kf["e"], default))
+            } else {
+                None
+            };
+            let hold = kf["h"].as_i64().unwrap_or(0) != 0;
+            let easing_in = parse_easing_handle(&kf["i"]);
+            let easing_out = parse_easing_handle(&kf["o"]);
 
-        let tan_in = parse_spatial_tangent(&kf["ti"]);
-        let tan_out = parse_spatial_tangent(&kf["to"]);
+            let tan_in = parse_spatial_tangent(&kf["ti"]);
+            let tan_out = parse_spatial_tangent(&kf["to"]);
 
-        Some(Keyframe {
-            time,
-            value,
-            end_value,
-            easing_in,
-            easing_out,
-            hold,
-            tan_in,
-            tan_out,
+            Some(Keyframe {
+                time,
+                value,
+                end_value,
+                easing_in,
+                easing_out,
+                hold,
+                tan_in,
+                tan_out,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     if keyframes.is_empty() {
         AnimatedValue::Static(default)
@@ -291,29 +305,32 @@ fn parse_animated_color(val: &Value) -> AnimatedValue<Color> {
         return AnimatedValue::Static(Color::WHITE);
     };
 
-    let keyframes = arr.iter().filter_map(|kf| {
-        let time = kf["t"].as_f64()? as f32;
-        let value = extract_color_from_arr(&kf["s"]);
-        let end_value = if kf.get("e").is_some() {
-            Some(extract_color_from_arr(&kf["e"]))
-        } else {
-            None
-        };
-        let hold = kf["h"].as_i64().unwrap_or(0) != 0;
-        let easing_in = parse_easing_handle(&kf["i"]);
-        let easing_out = parse_easing_handle(&kf["o"]);
+    let keyframes = arr
+        .iter()
+        .filter_map(|kf| {
+            let time = kf["t"].as_f64()? as f32;
+            let value = extract_color_from_arr(&kf["s"]);
+            let end_value = if kf.get("e").is_some() {
+                Some(extract_color_from_arr(&kf["e"]))
+            } else {
+                None
+            };
+            let hold = kf["h"].as_i64().unwrap_or(0) != 0;
+            let easing_in = parse_easing_handle(&kf["i"]);
+            let easing_out = parse_easing_handle(&kf["o"]);
 
-        Some(Keyframe {
-            time,
-            value,
-            end_value,
-            easing_in,
-            easing_out,
-            hold,
-            tan_in: None,
-            tan_out: None,
+            Some(Keyframe {
+                time,
+                value,
+                end_value,
+                easing_in,
+                easing_out,
+                hold,
+                tan_in: None,
+                tan_out: None,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     if keyframes.is_empty() {
         AnimatedValue::Static(Color::WHITE)
@@ -339,46 +356,49 @@ fn parse_animated_bezier_path(val: &Value) -> AnimatedValue<BezierPath> {
         return AnimatedValue::Static(BezierPath::default());
     };
 
-    let keyframes = arr.iter().filter_map(|kf| {
-        let time = kf["t"].as_f64()? as f32;
-        let value = if let Some(s_arr) = kf["s"].as_array() {
-            if s_arr.len() == 1 {
-                parse_bezier_shape(&s_arr[0])
-            } else {
-                parse_bezier_shape(&kf["s"])
-            }
-        } else {
-            parse_bezier_shape(&kf["s"])
-        };
-        let end_value = if kf.get("e").is_some() {
-            let ev = if let Some(e_arr) = kf["e"].as_array() {
-                if e_arr.len() == 1 && e_arr[0].is_object() {
-                    parse_bezier_shape(&e_arr[0])
+    let keyframes = arr
+        .iter()
+        .filter_map(|kf| {
+            let time = kf["t"].as_f64()? as f32;
+            let value = if let Some(s_arr) = kf["s"].as_array() {
+                if s_arr.len() == 1 {
+                    parse_bezier_shape(&s_arr[0])
                 } else {
-                    parse_bezier_shape(&kf["e"])
+                    parse_bezier_shape(&kf["s"])
                 }
             } else {
-                parse_bezier_shape(&kf["e"])
+                parse_bezier_shape(&kf["s"])
             };
-            Some(ev)
-        } else {
-            None
-        };
-        let hold = kf["h"].as_i64().unwrap_or(0) != 0;
-        let easing_in = parse_easing_handle(&kf["i"]);
-        let easing_out = parse_easing_handle(&kf["o"]);
+            let end_value = if kf.get("e").is_some() {
+                let ev = if let Some(e_arr) = kf["e"].as_array() {
+                    if e_arr.len() == 1 && e_arr[0].is_object() {
+                        parse_bezier_shape(&e_arr[0])
+                    } else {
+                        parse_bezier_shape(&kf["e"])
+                    }
+                } else {
+                    parse_bezier_shape(&kf["e"])
+                };
+                Some(ev)
+            } else {
+                None
+            };
+            let hold = kf["h"].as_i64().unwrap_or(0) != 0;
+            let easing_in = parse_easing_handle(&kf["i"]);
+            let easing_out = parse_easing_handle(&kf["o"]);
 
-        Some(Keyframe {
-            time,
-            value,
-            end_value,
-            easing_in,
-            easing_out,
-            hold,
-            tan_in: None,
-            tan_out: None,
+            Some(Keyframe {
+                time,
+                value,
+                end_value,
+                easing_in,
+                easing_out,
+                hold,
+                tan_in: None,
+                tan_out: None,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     if keyframes.is_empty() {
         AnimatedValue::Static(BezierPath::default())
@@ -400,39 +420,48 @@ fn parse_animated_gradient_colors(val: &Value) -> AnimatedValue<GradientColors> 
 
     if !animated {
         let colors = extract_f32_array(k);
-        return AnimatedValue::Static(GradientColors { color_count, colors });
+        return AnimatedValue::Static(GradientColors {
+            color_count,
+            colors,
+        });
     }
 
     let Some(arr) = k.as_array() else {
         return AnimatedValue::Static(GradientColors::default());
     };
 
-    let keyframes = arr.iter().filter_map(|kf| {
-        let time = kf["t"].as_f64()? as f32;
-        let colors = extract_f32_array(&kf["s"]);
-        let end_colors = if kf.get("e").is_some() {
-            Some(GradientColors {
-                color_count,
-                colors: extract_f32_array(&kf["e"]),
-            })
-        } else {
-            None
-        };
-        let hold = kf["h"].as_i64().unwrap_or(0) != 0;
-        let easing_in = parse_easing_handle(&kf["i"]);
-        let easing_out = parse_easing_handle(&kf["o"]);
+    let keyframes = arr
+        .iter()
+        .filter_map(|kf| {
+            let time = kf["t"].as_f64()? as f32;
+            let colors = extract_f32_array(&kf["s"]);
+            let end_colors = if kf.get("e").is_some() {
+                Some(GradientColors {
+                    color_count,
+                    colors: extract_f32_array(&kf["e"]),
+                })
+            } else {
+                None
+            };
+            let hold = kf["h"].as_i64().unwrap_or(0) != 0;
+            let easing_in = parse_easing_handle(&kf["i"]);
+            let easing_out = parse_easing_handle(&kf["o"]);
 
-        Some(Keyframe {
-            time,
-            value: GradientColors { color_count, colors },
-            end_value: end_colors,
-            easing_in,
-            easing_out,
-            hold,
-            tan_in: None,
-            tan_out: None,
+            Some(Keyframe {
+                time,
+                value: GradientColors {
+                    color_count,
+                    colors,
+                },
+                end_value: end_colors,
+                easing_in,
+                easing_out,
+                hold,
+                tan_in: None,
+                tan_out: None,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     if keyframes.is_empty() {
         AnimatedValue::Static(GradientColors::default())
@@ -444,7 +473,9 @@ fn parse_animated_gradient_colors(val: &Value) -> AnimatedValue<GradientColors> 
 // ─── Shapes ──────────────────────────────────────────────────
 
 fn parse_shapes(val: &Value) -> Vec<ShapeItem> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
     arr.iter().filter_map(|s| parse_shape_item(s)).collect()
 }
 
@@ -464,30 +495,24 @@ fn parse_shape_item(val: &Value) -> Option<ShapeItem> {
                 hidden,
             }))
         }
-        "rc" => {
-            Some(ShapeItem::Rect(ShapeRect {
-                name,
-                position: parse_animated_vec2d(&val["p"]),
-                size: parse_animated_vec2d(&val["s"]),
-                roundness: parse_animated_f32(&val["r"]),
-                hidden,
-            }))
-        }
-        "el" => {
-            Some(ShapeItem::Ellipse(ShapeEllipse {
-                name,
-                position: parse_animated_vec2d(&val["p"]),
-                size: parse_animated_vec2d(&val["s"]),
-                hidden,
-            }))
-        }
-        "sh" => {
-            Some(ShapeItem::Path(ShapePath {
-                name,
-                shape: parse_animated_bezier_path(&val["ks"]),
-                hidden,
-            }))
-        }
+        "rc" => Some(ShapeItem::Rect(ShapeRect {
+            name,
+            position: parse_animated_vec2d(&val["p"]),
+            size: parse_animated_vec2d(&val["s"]),
+            roundness: parse_animated_f32(&val["r"]),
+            hidden,
+        })),
+        "el" => Some(ShapeItem::Ellipse(ShapeEllipse {
+            name,
+            position: parse_animated_vec2d(&val["p"]),
+            size: parse_animated_vec2d(&val["s"]),
+            hidden,
+        })),
+        "sh" => Some(ShapeItem::Path(ShapePath {
+            name,
+            shape: parse_animated_bezier_path(&val["ks"]),
+            hidden,
+        })),
         "sr" => {
             let star_type = match val["sy"].as_i64().unwrap_or(1) {
                 2 => PolystarType::Polygon,
@@ -519,19 +544,17 @@ fn parse_shape_item(val: &Value) -> Option<ShapeItem> {
                 hidden,
             }))
         }
-        "st" => {
-            Some(ShapeItem::Stroke(ShapeStroke {
-                name,
-                color: parse_animated_color(&val["c"]),
-                opacity: parse_animated_f32_with_default(&val["o"], 100.0),
-                width: parse_animated_f32(&val["w"]),
-                line_cap: parse_stroke_cap(val["lc"].as_i64().unwrap_or(1) as u32),
-                line_join: parse_stroke_join(val["lj"].as_i64().unwrap_or(1) as u32),
-                miter_limit: val["ml"].as_f64().unwrap_or(4.0) as f32,
-                dashes: parse_stroke_dashes(&val["d"]),
-                hidden,
-            }))
-        }
+        "st" => Some(ShapeItem::Stroke(ShapeStroke {
+            name,
+            color: parse_animated_color(&val["c"]),
+            opacity: parse_animated_f32_with_default(&val["o"], 100.0),
+            width: parse_animated_f32(&val["w"]),
+            line_cap: parse_stroke_cap(val["lc"].as_i64().unwrap_or(1) as u32),
+            line_join: parse_stroke_join(val["lj"].as_i64().unwrap_or(1) as u32),
+            miter_limit: val["ml"].as_f64().unwrap_or(4.0) as f32,
+            dashes: parse_stroke_dashes(&val["d"]),
+            hidden,
+        })),
         "gf" => {
             let gradient_type = match val["t"].as_i64().unwrap_or(1) {
                 2 => GradientType::Radial,
@@ -571,9 +594,7 @@ fn parse_shape_item(val: &Value) -> Option<ShapeItem> {
                 hidden,
             }))
         }
-        "tr" => {
-            Some(ShapeItem::Transform(parse_transform(val)))
-        }
+        "tr" => Some(ShapeItem::Transform(parse_transform(val))),
         "tm" => {
             let trim_type = match val["m"].as_i64().unwrap_or(1) {
                 2 => TrimPathType::Individually,
@@ -588,29 +609,23 @@ fn parse_shape_item(val: &Value) -> Option<ShapeItem> {
                 hidden,
             }))
         }
-        "rd" => {
-            Some(ShapeItem::RoundedCorners(ShapeRoundedCorners {
-                name,
-                radius: parse_animated_f32(&val["r"]),
-                hidden,
-            }))
-        }
-        "rp" => {
-            Some(ShapeItem::Repeater(ShapeRepeater {
-                name,
-                copies: parse_animated_f32(&val["c"]),
-                offset: parse_animated_f32(&val["o"]),
-                transform: parse_transform(&val["tr"]),
-                hidden,
-            }))
-        }
-        "mm" => {
-            Some(ShapeItem::MergePaths(ShapeMergePaths {
-                name,
-                mode: val["mm"].as_u64().unwrap_or(1) as u32,
-                hidden,
-            }))
-        }
+        "rd" => Some(ShapeItem::RoundedCorners(ShapeRoundedCorners {
+            name,
+            radius: parse_animated_f32(&val["r"]),
+            hidden,
+        })),
+        "rp" => Some(ShapeItem::Repeater(ShapeRepeater {
+            name,
+            copies: parse_animated_f32(&val["c"]),
+            offset: parse_animated_f32(&val["o"]),
+            transform: parse_transform(&val["tr"]),
+            hidden,
+        })),
+        "mm" => Some(ShapeItem::MergePaths(ShapeMergePaths {
+            name,
+            mode: val["mm"].as_u64().unwrap_or(1) as u32,
+            hidden,
+        })),
         _ => None,
     }
 }
@@ -618,32 +633,38 @@ fn parse_shape_item(val: &Value) -> Option<ShapeItem> {
 // ─── Masks ───────────────────────────────────────────────────
 
 fn parse_masks(val: &Value) -> Vec<LottieMask> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
-    arr.iter().map(|m| {
-        let mode = match m["mode"].as_str().unwrap_or("a") {
-            "n" => MaskMode::None,
-            "a" => MaskMode::Add,
-            "s" => MaskMode::Subtract,
-            "i" => MaskMode::Intersect,
-            "l" => MaskMode::Lighten,
-            "d" => MaskMode::Darken,
-            "f" => MaskMode::Difference,
-            _ => MaskMode::Add,
-        };
-        LottieMask {
-            mode,
-            shape: parse_animated_bezier_path(&m["pt"]),
-            opacity: parse_animated_f32_with_default(&m["o"], 100.0),
-            expand: parse_animated_f32(&m["x"]),
-            inverted: m["inv"].as_bool().unwrap_or(false),
-        }
-    }).collect()
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|m| {
+            let mode = match m["mode"].as_str().unwrap_or("a") {
+                "n" => MaskMode::None,
+                "a" => MaskMode::Add,
+                "s" => MaskMode::Subtract,
+                "i" => MaskMode::Intersect,
+                "l" => MaskMode::Lighten,
+                "d" => MaskMode::Darken,
+                "f" => MaskMode::Difference,
+                _ => MaskMode::Add,
+            };
+            LottieMask {
+                mode,
+                shape: parse_animated_bezier_path(&m["pt"]),
+                opacity: parse_animated_f32_with_default(&m["o"], 100.0),
+                expand: parse_animated_f32(&m["x"]),
+                inverted: m["inv"].as_bool().unwrap_or(false),
+            }
+        })
+        .collect()
 }
 
 // ─── Effects ─────────────────────────────────────────────────
 
 fn parse_effects(val: &Value) -> Vec<LottieEffect> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
     arr.iter().filter_map(|e| parse_effect(e)).collect()
 }
 
@@ -698,7 +719,9 @@ fn parse_effect(val: &Value) -> Option<LottieEffect> {
 }
 
 fn get_effect_param_f32(params: &Value, index: usize) -> AnimatedValue<f32> {
-    let Some(arr) = params.as_array() else { return AnimatedValue::Static(0.0) };
+    let Some(arr) = params.as_array() else {
+        return AnimatedValue::Static(0.0);
+    };
     if index < arr.len() {
         parse_animated_f32(&arr[index]["v"])
     } else {
@@ -707,7 +730,9 @@ fn get_effect_param_f32(params: &Value, index: usize) -> AnimatedValue<f32> {
 }
 
 fn get_effect_param_color(params: &Value, index: usize) -> AnimatedValue<Color> {
-    let Some(arr) = params.as_array() else { return AnimatedValue::Static(Color::WHITE) };
+    let Some(arr) = params.as_array() else {
+        return AnimatedValue::Static(Color::WHITE);
+    };
     if index < arr.len() {
         parse_animated_color(&arr[index]["v"])
     } else {
@@ -736,31 +761,39 @@ fn parse_bezier_shape(val: &Value) -> BezierPath {
 }
 
 fn parse_vec2d_array(val: &Value) -> Vec<Vec2D> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
-    arr.iter().map(|v| {
-        let x = v.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        let y = v.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        Vec2D::new(x, y)
-    }).collect()
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|v| {
+            let x = v.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let y = v.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            Vec2D::new(x, y)
+        })
+        .collect()
 }
 
 // ─── Stroke dashes ───────────────────────────────────────────
 
 fn parse_stroke_dashes(val: &Value) -> Vec<StrokeDash> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
-    arr.iter().map(|d| {
-        let dash_type = match d["n"].as_str().unwrap_or("d") {
-            "d" => StrokeDashType::Dash,
-            "g" => StrokeDashType::Gap,
-            "o" => StrokeDashType::Offset,
-            _ => StrokeDashType::Dash,
-        };
-        StrokeDash {
-            name: d["nm"].as_str().unwrap_or("").to_string(),
-            value: parse_animated_f32(&d["v"]),
-            dash_type,
-        }
-    }).collect()
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|d| {
+            let dash_type = match d["n"].as_str().unwrap_or("d") {
+                "d" => StrokeDashType::Dash,
+                "g" => StrokeDashType::Gap,
+                "o" => StrokeDashType::Offset,
+                _ => StrokeDashType::Dash,
+            };
+            StrokeDash {
+                name: d["nm"].as_str().unwrap_or("").to_string(),
+                value: parse_animated_f32(&d["v"]),
+                dash_type,
+            }
+        })
+        .collect()
 }
 
 // ─── Easing ──────────────────────────────────────────────────
@@ -805,7 +838,9 @@ fn extract_f32(val: &Value, default: f32) -> f32 {
     if let Some(n) = val.as_f64() {
         n as f32
     } else if let Some(arr) = val.as_array() {
-        arr.first().and_then(|v| v.as_f64()).unwrap_or(default as f64) as f32
+        arr.first()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default as f64) as f32
     } else {
         default
     }
@@ -815,7 +850,9 @@ fn extract_f32_from_keyframe_value(val: &Value, default: f32) -> f32 {
     if let Some(n) = val.as_f64() {
         n as f32
     } else if let Some(arr) = val.as_array() {
-        arr.first().and_then(|v| v.as_f64()).unwrap_or(default as f64) as f32
+        arr.first()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default as f64) as f32
     } else {
         default
     }
@@ -823,8 +860,14 @@ fn extract_f32_from_keyframe_value(val: &Value, default: f32) -> f32 {
 
 fn extract_vec2d(val: &Value, default: Vec2D) -> Vec2D {
     if let Some(arr) = val.as_array() {
-        let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(default.x as f64) as f32;
-        let y = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(default.y as f64) as f32;
+        let x = arr
+            .get(0)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default.x as f64) as f32;
+        let y = arr
+            .get(1)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default.y as f64) as f32;
         Vec2D::new(x, y)
     } else {
         default
@@ -852,7 +895,9 @@ fn extract_color_from_arr(val: &Value) -> Color {
 }
 
 fn extract_f32_array(val: &Value) -> Vec<f32> {
-    let Some(arr) = val.as_array() else { return Vec::new() };
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
     arr.iter()
         .filter_map(|v| v.as_f64().map(|f| f as f32))
         .collect()
@@ -889,17 +934,18 @@ pub fn load_from_file(path: &str) -> Result<LottieComposition, String> {
 /// Load a Lottie composition from a .lottie (ZIP) file
 #[cfg(feature = "native")]
 pub fn load_from_dotlottie(path: &str) -> Result<LottieComposition, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("Failed to open file {}: {}", path, e))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Failed to read ZIP: {}", e))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to open file {}: {}", path, e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read ZIP: {}", e))?;
 
     // Collect file names first to avoid borrow issues
     let file_names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
     let has_manifest = file_names.iter().any(|n| n == "manifest.json");
 
     let json_name = if has_manifest {
-        let manifest = archive.by_name("manifest.json")
+        let manifest = archive
+            .by_name("manifest.json")
             .map_err(|e| format!("Failed to read manifest: {}", e))?;
         let manifest_val: Value = serde_json::from_reader(manifest)
             .map_err(|e| format!("Failed to parse manifest: {}", e))?;
@@ -910,13 +956,15 @@ pub fn load_from_dotlottie(path: &str) -> Result<LottieComposition, String> {
             .map(|id| format!("animations/{}.json", id))
             .unwrap_or_else(|| "animations/0.json".to_string())
     } else {
-        file_names.iter()
+        file_names
+            .iter()
             .find(|n| n.ends_with(".json") && !n.contains("manifest"))
             .cloned()
             .ok_or_else(|| "No animation JSON found in .lottie file".to_string())?
     };
 
-    let json_file = archive.by_name(&json_name)
+    let json_file = archive
+        .by_name(&json_name)
         .map_err(|e| format!("Failed to read {} from ZIP: {}", json_name, e))?;
     let root: Value = serde_json::from_reader(json_file)
         .map_err(|e| format!("Failed to parse animation JSON: {}", e))?;

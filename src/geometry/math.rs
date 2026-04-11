@@ -218,10 +218,22 @@ impl Mat2D {
 
     pub fn to_mat4_bytes(&self) -> [f32; 16] {
         [
-            self.values[0], self.values[1], 0.0, 0.0,
-            self.values[2], self.values[3], 0.0, 0.0,
-            0.0,            0.0,            1.0, 0.0,
-            self.values[4], self.values[5], 0.0, 1.0,
+            self.values[0],
+            self.values[1],
+            0.0,
+            0.0,
+            self.values[2],
+            self.values[3],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            self.values[4],
+            self.values[5],
+            0.0,
+            1.0,
         ]
     }
 }
@@ -381,9 +393,24 @@ pub struct Color {
 }
 
 impl Color {
-    pub const WHITE: Self = Self { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-    pub const BLACK: Self = Self { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
-    pub const TRANSPARENT: Self = Self { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+    pub const WHITE: Self = Self {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    pub const BLACK: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    pub const TRANSPARENT: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    };
 
     pub fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { r, g, b, a }

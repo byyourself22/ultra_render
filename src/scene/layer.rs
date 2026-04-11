@@ -1,9 +1,9 @@
+use super::transform::{evaluate_transform, ComputedTransform};
 use crate::geometry::math::Mat2D;
 use crate::geometry::path::RawPath;
 use crate::lottie::model::*;
-use crate::lottie::property::*;
 use crate::lottie::modifiers;
-use super::transform::{ComputedTransform, evaluate_transform};
+use crate::lottie::property::*;
 
 /// Runtime layer in the scene graph
 #[derive(Clone, Debug)]
@@ -88,6 +88,9 @@ pub struct ShapeDrawCommand {
     pub path: RawPath,
     pub paint: ShapePaint,
     pub blend_mode: crate::lottie::model::BlendMode,
+    /// Index into the per-frame sprite_transforms storage buffer.
+    /// Set by the canvas when collecting draws; 0 for single-sprite rendering.
+    pub sprite_index: u32,
 }
 
 /// Paint style for a shape draw
@@ -137,6 +140,27 @@ impl ShapePaint {
             ShapePaint::GradientStroke { opacity, .. } => *opacity *= layer_opacity,
         }
     }
+
+    /// Apply an artboard-space transform to paint attributes that live in path space.
+    pub fn apply_transform(&mut self, mat: &Mat2D) {
+        match self {
+            ShapePaint::SolidFill { .. } => {}
+            ShapePaint::SolidStroke { width, .. } => {
+                *width *= mat.max_scale();
+            }
+            ShapePaint::GradientFill { start, end, .. } => {
+                *start = mat.transform_point(*start);
+                *end = mat.transform_point(*end);
+            }
+            ShapePaint::GradientStroke {
+                start, end, width, ..
+            } => {
+                *start = mat.transform_point(*start);
+                *end = mat.transform_point(*end);
+                *width *= mat.max_scale();
+            }
+        }
+    }
 }
 
 /// Collect draw commands from a shape list.
@@ -181,6 +205,7 @@ fn collect_shape_draws(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<Shap
                     if let Some((mat, opacity)) = group_transform {
                         for mut cmd in group_commands {
                             cmd.path = cmd.path.transform(&mat);
+                            cmd.paint.apply_transform(&mat);
                             cmd.paint.apply_opacity(opacity);
                             commands.push(cmd);
                         }
@@ -226,8 +251,15 @@ fn collect_shape_draws(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<Shap
                 let inner_round = eval_f32(&star.inner_roundness, frame) / 100.0;
                 let is_star = star.star_type == PolystarType::Star;
                 path.add_polystar(
-                    pos.x, pos.y, points as u32, outer_r, inner_r,
-                    outer_round, inner_round, rotation, is_star,
+                    pos.x,
+                    pos.y,
+                    points as u32,
+                    outer_r,
+                    inner_r,
+                    outer_round,
+                    inner_round,
+                    rotation,
+                    is_star,
                 );
                 paths.push(path);
             }
@@ -249,6 +281,7 @@ fn collect_shape_draws(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<Shap
                             fill_rule: fill.fill_rule,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -273,6 +306,7 @@ fn collect_shape_draws(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<Shap
                             miter_limit: stroke.miter_limit,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -298,6 +332,7 @@ fn collect_shape_draws(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<Shap
                             fill_rule: gf.fill_rule,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -327,6 +362,7 @@ fn collect_shape_draws(shapes: &[ShapeItem], frame: f32, commands: &mut Vec<Shap
                             miter_limit: gs.miter_limit,
                         },
                         blend_mode: BlendMode::Normal,
+                        sprite_index: 0,
                     });
                 }
             }
@@ -368,7 +404,14 @@ pub fn bezier_to_raw_path(bezier: &BezierPath) -> RawPath {
         if ot.x.abs() < 1e-4 && ot.y.abs() < 1e-4 && it.x.abs() < 1e-4 && it.y.abs() < 1e-4 {
             path.line_to(bezier.vertices[i].x, bezier.vertices[i].y);
         } else {
-            path.cubic_to(cp1x, cp1y, cp2x, cp2y, bezier.vertices[i].x, bezier.vertices[i].y);
+            path.cubic_to(
+                cp1x,
+                cp1y,
+                cp2x,
+                cp2y,
+                bezier.vertices[i].x,
+                bezier.vertices[i].y,
+            );
         }
     }
 
@@ -394,7 +437,14 @@ pub fn bezier_to_raw_path(bezier: &BezierPath) -> RawPath {
         if ot.x.abs() < 1e-4 && ot.y.abs() < 1e-4 && it.x.abs() < 1e-4 && it.y.abs() < 1e-4 {
             // No tangents, just close
         } else {
-            path.cubic_to(cp1x, cp1y, cp2x, cp2y, bezier.vertices[0].x, bezier.vertices[0].y);
+            path.cubic_to(
+                cp1x,
+                cp1y,
+                cp2x,
+                cp2y,
+                bezier.vertices[0].x,
+                bezier.vertices[0].y,
+            );
         }
         path.close();
     }

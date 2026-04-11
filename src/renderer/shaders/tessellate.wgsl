@@ -23,9 +23,9 @@ struct GpuCubicSegment {
     first_vertex_idx: u32,
     flags: u32,
     paint_index: u32,
+    sprite_index: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 struct GpuVertex {
@@ -34,7 +34,7 @@ struct GpuVertex {
     color: vec4<f32>,
     world_pos: vec2<f32>,
     paint_index: u32,
-    _pad: u32,
+    sprite_index: u32,
 };
 
 struct TessUniforms {
@@ -102,13 +102,20 @@ fn cs_tessellate(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let normal = vec2<f32>(-tangent.y, tangent.x) / len;
                 pos = pos + normal * seg.normal_offset;
             }
-            // UV.x encodes left (0) vs right (1) for AA
-            uv.x = select(0.0, 1.0, seg.normal_offset < 0.0);
+            // UV encodes stroke side for analytic edge AA in the draw shader.
+            uv = vec2<f32>(select(0.0, 1.0, seg.normal_offset < 0.0), 1.0);
         }
 
         let vi = seg.first_vertex_idx + i;
         if (vi < uniforms.total_vertices) {
-            output_vertices[vi] = GpuVertex(pos, uv, seg.color, world_pos, seg.paint_index, 0u);
+            output_vertices[vi] = GpuVertex(
+                pos,
+                uv,
+                seg.color,
+                world_pos,
+                seg.paint_index,
+                seg.sprite_index,
+            );
         }
     }
 }

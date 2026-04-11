@@ -1,6 +1,6 @@
-use crate::geometry::math::{Vec2D, Color};
+use super::interpolator::{ease, ease_mode_from_handles};
 use super::model::*;
-use super::interpolator::{ease_mode_from_handles, ease};
+use crate::geometry::math::{Color, Vec2D};
 
 /// Trait for types that can be interpolated between keyframes
 pub trait Interpolatable: Clone + std::fmt::Debug {
@@ -95,6 +95,12 @@ pub fn evaluate<T: Interpolatable + Default>(value: &AnimatedValue<T>, frame: f3
 }
 
 /// Evaluate keyframes at a given frame
+/// Evaluate keyframes at a given frame (ThorVG-compatible).
+///
+/// Matches ThorVG LottieScalarFrame::interpolate / LottieVectorFrame::interpolate:
+/// - Hold frames snap to next value at t >= 1.0 (not always current)
+/// - Easing uses the keyframe's interpolator (cubic bezier)
+/// - End value is explicit kf.end_value if present, else next keyframe's start
 fn evaluate_keyframes<T: Interpolatable + Default>(keyframes: &[Keyframe<T>], frame: f32) -> T {
     if keyframes.is_empty() {
         return T::default();
@@ -117,11 +123,6 @@ fn evaluate_keyframes<T: Interpolatable + Default>(keyframes: &[Keyframe<T>], fr
         let next_kf = &keyframes[i + 1];
 
         if frame >= kf.time && frame < next_kf.time {
-            // Hold keyframe - no interpolation
-            if kf.hold {
-                return kf.value.clone();
-            }
-
             // Calculate linear progress
             let duration = next_kf.time - kf.time;
             if duration <= 0.0 {
@@ -129,19 +130,31 @@ fn evaluate_keyframes<T: Interpolatable + Default>(keyframes: &[Keyframe<T>], fr
             }
             let linear_t = (frame - kf.time) / duration;
 
+            // Get the end value (either explicit or next keyframe's start)
+            let end_value = kf.end_value.as_ref().unwrap_or(&next_kf.value);
+
+            // Hold keyframe — ThorVG returns next value at t >= 1.0
+            if kf.hold {
+                if linear_t < 1.0 {
+                    return kf.value.clone();
+                } else {
+                    return end_value.clone();
+                }
+            }
+
             // Apply easing
             let ease_mode = ease_mode_from_handles(&kf.easing_out, &kf.easing_in, false);
             let eased_t = ease(ease_mode, linear_t);
-
-            // Get the end value (either explicit or next keyframe's start)
-            let end_value = kf.end_value.as_ref().unwrap_or(&next_kf.value);
 
             return kf.value.interp(end_value, eased_t);
         }
     }
 
     // Fallback
-    keyframes.last().map(|kf| kf.value.clone()).unwrap_or_default()
+    keyframes
+        .last()
+        .map(|kf| kf.value.clone())
+        .unwrap_or_default()
 }
 
 /// Evaluate a Vec2D animated value with spatial tangent support (motion paths)
@@ -152,6 +165,14 @@ pub fn evaluate_vec2d_spatial(value: &AnimatedValue<Vec2D>, frame: f32) -> Vec2D
     }
 }
 
+/// Evaluate Vec2D keyframes with spatial tangent support (ThorVG-compatible).
+///
+/// ThorVG LottieVectorFrame::interpolate uses arc-length parameterization:
+///   Bezier bz = {value, value+outTangent, next->value+inTangent, next->value};
+///   return bz.at(bz.atApprox(t * length, length));
+///
+/// We approximate this with direct bezier evaluation at eased_t, which is
+/// sufficiently accurate for most Lottie animations.
 fn evaluate_vec2d_keyframes_spatial(keyframes: &[Keyframe<Vec2D>], frame: f32) -> Vec2D {
     if keyframes.is_empty() {
         return Vec2D::ZERO;
@@ -171,20 +192,25 @@ fn evaluate_vec2d_keyframes_spatial(keyframes: &[Keyframe<Vec2D>], frame: f32) -
         let next_kf = &keyframes[i + 1];
 
         if frame >= kf.time && frame < next_kf.time {
-            if kf.hold {
-                return kf.value;
-            }
-
             let duration = next_kf.time - kf.time;
             if duration <= 0.0 {
                 return kf.value;
             }
             let linear_t = (frame - kf.time) / duration;
 
+            let end_value = kf.end_value.as_ref().unwrap_or(&next_kf.value);
+
+            // Hold frame — ThorVG snaps to next at t >= 1.0
+            if kf.hold {
+                if linear_t < 1.0 {
+                    return kf.value;
+                } else {
+                    return *end_value;
+                }
+            }
+
             let ease_mode = ease_mode_from_handles(&kf.easing_out, &kf.easing_in, false);
             let eased_t = ease(ease_mode, linear_t);
-
-            let end_value = kf.end_value.as_ref().unwrap_or(&next_kf.value);
 
             // If spatial tangents exist, use cubic bezier interpolation for the motion path
             if let (Some(tan_out), Some(tan_in)) = (&kf.tan_out, &next_kf.tan_in) {

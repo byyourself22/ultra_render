@@ -8,6 +8,8 @@ interface WasmModule {
   get_anim_fps: () => number;
   get_anim_frame: () => number;
   get_anim_total_frames: () => number;
+  get_subframes: () => number;
+  get_tess_unique: () => number;
   get_stats_json: () => string;
   request_sprite_count: (n: number) => void;
   set_batch_synced: (synced: boolean) => void;
@@ -17,13 +19,15 @@ interface WasmModule {
 }
 
 async function main() {
-  const statFps       = document.getElementById('stat-fps')!;
-  const statDraws     = document.getElementById('stat-draws')!;
-  const statSprites   = document.getElementById('stat-sprites')!;
-  const statAnimFps   = document.getElementById('stat-anim-fps')!;
-  const statAnimFrame = document.getElementById('stat-anim-frame')!;
-  const statMode      = document.getElementById('stat-mode')!;
-  const statStatus    = document.getElementById('stat-status')!;
+  const statFps        = document.getElementById('stat-fps')!;
+  const statDraws      = document.getElementById('stat-draws')!;
+  const statSprites    = document.getElementById('stat-sprites')!;
+  const statAnimFps    = document.getElementById('stat-anim-fps')!;
+  const statAnimFrame  = document.getElementById('stat-anim-frame')!;
+  const statSubframes  = document.getElementById('stat-subframes')!;
+  const statTessUnique = document.getElementById('stat-tess-unique')!;
+  const statMode       = document.getElementById('stat-mode')!;
+  const statStatus     = document.getElementById('stat-status')!;
   const ctrlCount     = document.getElementById('ctrl-count')!;
   const btnLess       = document.getElementById('btn-less')! as HTMLButtonElement;
   const btnMore       = document.getElementById('btn-more')! as HTMLButtonElement;
@@ -120,6 +124,11 @@ async function main() {
       const animTotal = wasm.get_anim_total_frames();
       statAnimFps.textContent   = animFps.toFixed(0) + ' Hz';
       statAnimFrame.textContent = animFrame.toFixed(1) + ' / ' + animTotal.toFixed(0);
+
+      const subframes  = wasm.get_subframes();
+      const tessUnique = wasm.get_tess_unique();
+      statSubframes.textContent  = subframes.toFixed(1) + 'x';
+      statTessUnique.textContent = String(tessUnique);
 
       const synced = wasm.get_batch_synced();
       statMode.textContent = synced ? 'batch (synced)' : 'unbatch';

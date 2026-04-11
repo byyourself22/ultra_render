@@ -19,12 +19,16 @@ pub struct RenderContext {
     pub height: u32,
     pub msaa_texture: Option<Texture>,
     pub msaa_view: Option<TextureView>,
+    pub depth_stencil_texture: Option<Texture>,
+    pub depth_stencil_view: Option<TextureView>,
 }
 
 impl RenderContext {
     /// Create a render context with a window surface
     pub async fn new(window: std::sync::Arc<winit::window::Window>) -> Self {
         let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::all(),
             ..Default::default()
@@ -62,19 +66,30 @@ impl RenderContext {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Rive-style: prefer Mailbox (uncapped, no tearing) > Immediate > Fifo (vsync fallback)
+        let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
+            PresentMode::Mailbox
+        } else if surface_caps.present_modes.contains(&PresentMode::Immediate) {
+            PresentMode::Immediate
+        } else {
+            PresentMode::Fifo // always supported
+        };
+
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: PresentMode::AutoVsync,
+            width,
+            height,
+            present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
 
-        let (msaa_texture, msaa_view) = create_msaa_texture(&device, format, size.width.max(1), size.height.max(1));
+        let (msaa_texture, msaa_view) = create_msaa_texture(&device, format, width, height);
+        let (depth_stencil_texture, depth_stencil_view) =
+            create_depth_stencil_texture(&device, width, height);
 
         let is_srgb = format.is_srgb();
 
@@ -87,10 +102,12 @@ impl RenderContext {
             surface_config: Some(config),
             format,
             is_srgb,
-            width: size.width,
-            height: size.height,
+            width,
+            height,
             msaa_texture: Some(msaa_texture),
             msaa_view: Some(msaa_view),
+            depth_stencil_texture: Some(depth_stencil_texture),
+            depth_stencil_view: Some(depth_stencil_view),
         }
     }
 
@@ -111,12 +128,20 @@ impl RenderContext {
         let (tex, view) = create_msaa_texture(&self.device, self.format, width, height);
         self.msaa_texture = Some(tex);
         self.msaa_view = Some(view);
+        let (depth_tex, depth_view) = create_depth_stencil_texture(&self.device, width, height);
+        self.depth_stencil_texture = Some(depth_tex);
+        self.depth_stencil_view = Some(depth_view);
     }
 }
 
 /// Create an MSAA multisample texture + view for anti-aliased rendering.
 /// The render pass draws into this texture, then resolves to the surface texture.
-fn create_msaa_texture(device: &Device, format: TextureFormat, width: u32, height: u32) -> (Texture, TextureView) {
+fn create_msaa_texture(
+    device: &Device,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+) -> (Texture, TextureView) {
     let texture = device.create_texture(&TextureDescriptor {
         label: Some("msaa texture"),
         size: Extent3d {
@@ -134,3 +159,27 @@ fn create_msaa_texture(device: &Device, format: TextureFormat, width: u32, heigh
     let view = texture.create_view(&TextureViewDescriptor::default());
     (texture, view)
 }
+
+fn create_depth_stencil_texture(
+    device: &Device,
+    width: u32,
+    height: u32,
+) -> (Texture, TextureView) {
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("depth stencil texture"),
+        size: Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: MSAA_SAMPLES,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth24PlusStencil8,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    (texture, view)
+}
+

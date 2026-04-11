@@ -1,4 +1,4 @@
-use crate::geometry::math::{Vec2D, Mat2D};
+use crate::geometry::math::{Mat2D, Vec2D};
 use crate::lottie::model::LottieTransform;
 use crate::lottie::property::{eval_f32, eval_vec2d, evaluate_vec2d_spatial};
 

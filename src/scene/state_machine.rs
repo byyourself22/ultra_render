@@ -1,3 +1,4 @@
+use crate::lottie::interpolator::cubic_bezier_ease;
 /// Rive-style StateMachine with proper transition mixing, exit time,
 /// state layers, and SMI inputs (Bool/Number/Trigger).
 ///
@@ -7,9 +8,7 @@
 /// - Exit time conditions
 /// - SMI input types with fire-once trigger semantics
 /// - Animation mixing during transitions
-
 use std::collections::HashMap;
-use crate::lottie::interpolator::cubic_bezier_ease;
 
 // ─── Inputs (Rive SMIBool/SMINumber/SMITrigger) ────────────
 
@@ -115,10 +114,10 @@ pub struct SMTransition {
     pub from_state: usize,
     pub to_state: usize,
     pub conditions: Vec<TransitionCondition>,
-    pub mix_time: f32,           // Blend duration in seconds (Rive transition mixing)
-    pub exit_time: Option<f32>,  // Normalized exit time (0..1) — Rive ExitTimeCondition
+    pub mix_time: f32, // Blend duration in seconds (Rive transition mixing)
+    pub exit_time: Option<f32>, // Normalized exit time (0..1) — Rive ExitTimeCondition
     pub easing: TransitionEasing,
-    pub pause_on_exit: bool,     // Pause source animation when transitioning out
+    pub pause_on_exit: bool, // Pause source animation when transitioning out
 }
 
 // ─── State Layer (Rive StateMachineLayerInstance) ────────────
@@ -129,11 +128,11 @@ pub struct SMTransition {
 pub struct SMLayer {
     pub current_state: usize,
     pub next_state: Option<usize>,
-    pub mix_progress: f32,       // 0..1 blend progress during transition
-    pub mix_duration: f32,       // Total transition time
+    pub mix_progress: f32, // 0..1 blend progress during transition
+    pub mix_duration: f32, // Total transition time
     pub mix_easing: TransitionEasing,
-    pub state_time: f32,         // Time spent in current state (seconds)
-    pub wait_for_exit: bool,     // Waiting for exit time condition
+    pub state_time: f32,     // Time spent in current state (seconds)
+    pub wait_for_exit: bool, // Waiting for exit time condition
 }
 
 impl SMLayer {
@@ -260,24 +259,29 @@ impl StateMachine {
                 layer.state_time = 0.0;
 
                 return AnimMixInfo {
-                    current_anim: self.states.get(completed_state)
+                    current_anim: self
+                        .states
+                        .get(completed_state)
                         .and_then(|s| s.animation_index),
                     next_anim: None,
                     mix: 0.0,
-                    speed: self.states.get(completed_state)
-                        .map(|s| s.speed).unwrap_or(1.0),
+                    speed: self
+                        .states
+                        .get(completed_state)
+                        .map(|s| s.speed)
+                        .unwrap_or(1.0),
                 };
             }
 
             let mix = layer.mix_easing.evaluate(layer.mix_progress);
             return AnimMixInfo {
-                current_anim: self.states.get(layer.current_state)
+                current_anim: self
+                    .states
+                    .get(layer.current_state)
                     .and_then(|s| s.animation_index),
-                next_anim: self.states.get(next)
-                    .and_then(|s| s.animation_index),
+                next_anim: self.states.get(next).and_then(|s| s.animation_index),
                 mix,
-                speed: self.states.get(next)
-                    .map(|s| s.speed).unwrap_or(1.0),
+                speed: self.states.get(next).map(|s| s.speed).unwrap_or(1.0),
             };
         }
 
@@ -312,18 +316,17 @@ impl StateMachine {
         }
 
         AnimMixInfo {
-            current_anim: self.states.get(current)
-                .and_then(|s| s.animation_index),
+            current_anim: self.states.get(current).and_then(|s| s.animation_index),
             next_anim: None,
             mix: 0.0,
-            speed: self.states.get(current)
-                .map(|s| s.speed).unwrap_or(1.0),
+            speed: self.states.get(current).map(|s| s.speed).unwrap_or(1.0),
         }
     }
 
     /// Get current state name for a layer
     pub fn current_state_name(&self, layer_idx: usize) -> &str {
-        self.layers.get(layer_idx)
+        self.layers
+            .get(layer_idx)
             .and_then(|l| self.states.get(l.current_state))
             .map(|s| s.name.as_str())
             .unwrap_or("")
@@ -336,10 +339,10 @@ impl StateMachine {
 /// The caller uses this to crossfade between two animations.
 #[derive(Clone, Debug)]
 pub struct AnimMixInfo {
-    pub current_anim: Option<usize>,  // Index of current animation
-    pub next_anim: Option<usize>,     // Index of target animation (during transition)
-    pub mix: f32,                     // 0.0 = fully current, 1.0 = fully next
-    pub speed: f32,                   // Playback speed
+    pub current_anim: Option<usize>, // Index of current animation
+    pub next_anim: Option<usize>,    // Index of target animation (during transition)
+    pub mix: f32,                    // 0.0 = fully current, 1.0 = fully next
+    pub speed: f32,                  // Playback speed
 }
 
 impl AnimMixInfo {

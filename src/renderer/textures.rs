@@ -109,12 +109,7 @@ fn sample_gradient(colors: &[f32], color_count: usize, t: f32) -> (f32, f32, f32
 
     if prev_idx == next_idx {
         let base = prev_idx * stride;
-        return (
-            colors[base + 1],
-            colors[base + 2],
-            colors[base + 3],
-            1.0,
-        );
+        return (colors[base + 1], colors[base + 2], colors[base + 3], 1.0);
     }
 
     let prev_base = prev_idx * stride;

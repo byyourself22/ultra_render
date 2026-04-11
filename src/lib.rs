@@ -1,20 +1,20 @@
 #![allow(dead_code)]
 
+pub mod app;
+pub mod engine;
 pub mod geometry;
 pub mod lottie;
-pub mod scene;
 pub mod renderer;
-pub mod engine;
-pub mod app;
+pub mod scene;
 
 // ─── Web entry point ────────────────────────────────────────
 
 #[cfg(feature = "web")]
 pub mod web {
+    use std::sync::atomic::Ordering;
     use wasm_bindgen::prelude::*;
     use winit::event_loop::EventLoop;
     use winit::platform::web::EventLoopExtWebSys;
-    use std::sync::atomic::Ordering;
 
     #[wasm_bindgen(start)]
     pub fn start() {
@@ -64,6 +64,18 @@ pub mod web {
         crate::app::STAT_ANIM_FRAMES.load(Ordering::Relaxed) as f32 / 10.0
     }
 
+    /// Render frames per animation frame (how smooth relative to animation Hz).
+    #[wasm_bindgen]
+    pub fn get_subframes() -> f32 {
+        crate::app::STAT_SUBFRAMES.load(Ordering::Relaxed) as f32 / 10.0
+    }
+
+    /// Number of unique tessellations performed this frame (1 for synced sprites).
+    #[wasm_bindgen]
+    pub fn get_tess_unique() -> u32 {
+        crate::app::STAT_TESS_UNIQUE.load(Ordering::Relaxed)
+    }
+
     /// Full stats JSON string including animation info.
     #[wasm_bindgen]
     pub fn get_stats_json() -> String {
@@ -74,9 +86,11 @@ pub mod web {
         let anim_frame = crate::app::STAT_ANIM_FRAME.load(Ordering::Relaxed) as f32 / 10.0;
         let anim_total = crate::app::STAT_ANIM_FRAMES.load(Ordering::Relaxed) as f32 / 10.0;
         let synced = crate::app::BATCH_SYNCED.load(Ordering::Relaxed);
+        let subframes = crate::app::STAT_SUBFRAMES.load(Ordering::Relaxed) as f32 / 10.0;
+        let unique_tess = crate::app::STAT_TESS_UNIQUE.load(Ordering::Relaxed);
         format!(
-            r#"{{"fps":{:.1},"draws":{},"sprites":{},"animFps":{:.0},"animFrame":{:.1},"animTotal":{:.0},"synced":{}}}"#,
-            fps, draws, sprites, anim_fps, anim_frame, anim_total, synced
+            r#"{{"fps":{:.1},"draws":{},"sprites":{},"animFps":{:.0},"animFrame":{:.1},"animTotal":{:.0},"synced":{},"subframes":{:.1},"uniqueTess":{}}}"#,
+            fps, draws, sprites, anim_fps, anim_frame, anim_total, synced, subframes, unique_tess
         )
     }
 
