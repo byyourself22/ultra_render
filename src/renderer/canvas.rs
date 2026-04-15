@@ -1,4 +1,4 @@
-use super::buffers::{ortho_projection, FrameUniforms, GpuBuffers};
+use super::buffers::{ortho_projection_zoom, FrameUniforms, GpuBuffers};
 use super::context::RenderContext;
 use super::pipeline;
 use crate::geometry::math::Mat2D;
@@ -21,7 +21,6 @@ pub struct RenderCanvas {
     pub complex_stencil_eo_pipeline: RenderPipeline,
     pub complex_cover_pipeline: RenderPipeline,
     pub fill_tessellate_pipeline: ComputePipeline,
-    pub fill_topology_pipeline: ComputePipeline,
     pub tessellate_pipeline: ComputePipeline,
     pub gpu_buffers: GpuBuffers,
     pub uniform_bind_group_layout: BindGroupLayout,
@@ -51,7 +50,6 @@ impl RenderCanvas {
         let complex_cover_pipeline =
             pipeline::create_complex_cover_pipeline(&ctx.device, ctx.format);
         let fill_tessellate_pipeline = pipeline::create_fill_tessellate_pipeline(&ctx.device);
-        let fill_topology_pipeline = pipeline::create_fill_topology_pipeline(&ctx.device);
         let tessellate_pipeline = pipeline::create_tessellate_pipeline(&ctx.device);
         let gpu_buffers = GpuBuffers::new(&ctx.device);
         let uniform_bind_group_layout = pipeline::create_uniform_bind_group_layout(&ctx.device);
@@ -69,7 +67,6 @@ impl RenderCanvas {
             complex_stencil_eo_pipeline,
             complex_cover_pipeline,
             fill_tessellate_pipeline,
-            fill_topology_pipeline,
             tessellate_pipeline,
             gpu_buffers,
             uniform_bind_group_layout,
@@ -113,6 +110,9 @@ impl RenderCanvas {
         geometry_stamp: u64,
         visible_sprite_count: u32,
         time: f32,
+        zoom: f32,
+        pan_x: f32,
+        pan_y: f32,
     ) -> Result<(), SurfaceError> {
         let surface = ctx.surface.as_ref().expect("No surface");
         let output = surface.get_current_texture()?;
@@ -122,7 +122,13 @@ impl RenderCanvas {
 
         // Frame uniforms
         let uniforms = FrameUniforms {
-            view_proj: ortho_projection(ctx.width as f32, ctx.height as f32),
+            view_proj: ortho_projection_zoom(
+                ctx.width as f32,
+                ctx.height as f32,
+                zoom,
+                pan_x,
+                pan_y,
+            ),
             resolution: [ctx.width as f32, ctx.height as f32],
             time,
             is_srgb: ctx.is_srgb as u32,
@@ -179,7 +185,7 @@ impl RenderCanvas {
                 label: Some("render encoder"),
             });
 
-        // Compute passes: fill tessellation first, then fill topology, then
+        // Compute passes: fill tessellation (cubics + fan indices), then
         // strokes, so the shared buffers are fully populated before drawing.
         if self.needs_tessellation {
             if self.gpu_buffers.fill_contour_count > 0 {
@@ -198,15 +204,8 @@ impl RenderCanvas {
                         cp.dispatch_workgroups(workgroups, 1, 1);
                     }
 
-                    if !self.gpu_buffers.complex_fill_draws.is_empty() {
-                        let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor {
-                            label: Some("fill topology pass"),
-                            timestamp_writes: None,
-                        });
-                        cp.set_pipeline(&self.fill_topology_pipeline);
-                        cp.set_bind_group(0, &fill_bg, &[]);
-                        cp.dispatch_workgroups(self.gpu_buffers.fill_contour_count, 1, 1);
-                    }
+                    // Topology pass removed — all midpoint-fan indices are now
+                    // emitted by cs_fill_tessellate directly (no GPU ear-clipping).
                 }
             }
 
@@ -338,4 +337,3 @@ impl RenderCanvas {
         Ok(())
     }
 }
-

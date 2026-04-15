@@ -182,4 +182,3 @@ fn create_depth_stencil_texture(
     let view = texture.create_view(&TextureViewDescriptor::default());
     (texture, view)
 }
-

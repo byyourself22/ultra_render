@@ -1,8 +1,9 @@
 //! GPU tessellation data structures (Rive-style).
 //!
-//! Fills:   GPU cubic edge tessellation plus CPU-generated index topology.
-//!          Simple fan-safe contours use midpoint fans; concave contours use
-//!          interior triangulation over the sampled edge vertices.
+//! Fills:   GPU cubic edge tessellation + GPU index topology.
+//!          Simple fan-safe contours use midpoint fans (direct draw).
+//!          Concave contours use stencil-based midpoint fans (stencil + cover).
+//!          No CPU fallback — all topology is generated on the GPU.
 //! Strokes: GPU compute shader (De Casteljau) → Rive-style offset quad-strips.
 //!
 //! Instancing:
@@ -22,9 +23,6 @@
 use super::math::{wang_cubic_segment_count, Color, Mat2D, Vec2D};
 use super::path::{PathVerb, RawPath};
 use bytemuck::{Pod, Zeroable};
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
 
 // ─── GPU vertex (output of compute, input to draw) ──────────
 
@@ -593,9 +591,13 @@ fn tessellate_sprite_fills(
         let fill_index_start = fill_indices.len() as u32;
         let complex_draw_start = complex_fill_draws.len();
         let same_winding = contours_have_uniform_winding(&contour_data);
-        let all_fan_safe = contour_data.iter().all(|contour| contour.fan_safe);
 
-        if fill_rule == crate::geometry::path::FillRule::NonZero && same_winding && all_fan_safe {
+        // NonZero + uniform winding: ALWAYS use simple midpoint fan.
+        // Overlapping fan triangles all share the same winding direction,
+        // so NonZero fill produces correct results even for concave shapes.
+        // This matches ThorVG's approach and eliminates render-path oscillation
+        // that causes visual trembling on animated concave shapes (e.g. chin).
+        if fill_rule == crate::geometry::path::FillRule::NonZero && same_winding {
             encode_fill_midpoint_fans(
                 &contour_data,
                 color,
@@ -692,12 +694,10 @@ fn tessellate_sprite_fills(
 
 // —— Fill topology selection ———————————————————————————————
 
-
 #[derive(Clone)]
 struct ContourFillData {
     contour: Contour,
     samples: Vec<Vec2D>,
-    edge_samples: Vec<Vec2D>,
     midpoint: Vec2D,
     signed_area: f32,
     fan_safe: bool,
@@ -706,8 +706,6 @@ struct ContourFillData {
 const FILL_TOPOLOGY_NONE: u32 = 0;
 const FILL_TOPOLOGY_SIMPLE: u32 = 1;
 const FILL_TOPOLOGY_COMPLEX_FAN: u32 = 2;
-const FILL_TOPOLOGY_COMPLEX_GPU: u32 = 3;
-const MAX_GPU_COMPLEX_FILL_VERTS: u32 = 512;
 
 fn collect_fill_contours(contours: &[Contour]) -> Vec<ContourFillData> {
     let mut result = Vec::new();
@@ -718,12 +716,11 @@ fn collect_fill_contours(contours: &[Contour]) -> Vec<ContourFillData> {
         }
 
         let samples = normalized_polygon(&contour_fill_samples(contour));
-        let edge_samples = normalized_polygon(&contour_edge_samples(contour));
-        if samples.len() < 3 || edge_samples.len() < 3 {
+        if samples.len() < 3 {
             continue;
         }
 
-        let signed_area = polygon_signed_area(&edge_samples);
+        let signed_area = polygon_signed_area(&samples);
         if signed_area.abs() < 1e-3 {
             continue;
         }
@@ -735,7 +732,6 @@ fn collect_fill_contours(contours: &[Contour]) -> Vec<ContourFillData> {
         result.push(ContourFillData {
             contour: contour.clone(),
             samples,
-            edge_samples,
             midpoint,
             signed_area,
             fan_safe,
@@ -833,41 +829,17 @@ fn encode_complex_fill(
 
         any_geometry = true;
 
-        let gpu_topology_mode = if contour.fan_safe {
-            Some(FILL_TOPOLOGY_COMPLEX_FAN)
-        } else if total_edge_verts <= MAX_GPU_COMPLEX_FILL_VERTS {
-            Some(FILL_TOPOLOGY_COMPLEX_GPU)
-        } else {
-            None
-        };
-
-        if let Some(topology_mode) = gpu_topology_mode {
-            let first_index = complex_fill_indices.len() as u32;
-            complex_fill_indices.resize(
-                complex_fill_indices.len() + total_edge_verts as usize * 3,
-                first_vertex,
-            );
-            if let Some(fill_contour) = fill_contours.last_mut() {
-                fill_contour.first_index = first_index;
-                fill_contour.simple_fill = topology_mode;
-            }
-            continue;
-        }
-
-        if !contour.fan_safe {
-            if let Some(indices) = cached_triangulate_polygon_indices(&contour.edge_samples) {
-                for idx in indices {
-                    complex_fill_indices.push(first_vertex + idx);
-                }
-                continue;
-            }
-        }
-
-        for i in 0..total_edge_verts {
-            let next = if i + 1 == total_edge_verts { 0 } else { i + 1 };
-            complex_fill_indices.push(midpoint_idx);
-            complex_fill_indices.push(first_vertex + i);
-            complex_fill_indices.push(first_vertex + next);
+        // Stencil-based complex fills: midpoint fan is always correct.
+        // The stencil accumulates winding, so overlapping/exterior fan
+        // triangles cancel out — no need for ear-clipping or CPU fallback.
+        let first_index = complex_fill_indices.len() as u32;
+        complex_fill_indices.resize(
+            complex_fill_indices.len() + total_edge_verts as usize * 3,
+            first_vertex,
+        );
+        if let Some(fill_contour) = fill_contours.last_mut() {
+            fill_contour.first_index = first_index;
+            fill_contour.simple_fill = FILL_TOPOLOGY_COMPLEX_FAN;
         }
     }
 
@@ -885,7 +857,7 @@ fn encode_complex_fill(
     for pos in cover_verts {
         fill_vertices.push(GpuVertex {
             position: pos,
-            uv: [0.0, 0.0],
+            uv: [1.0, 0.0], // uv.x=1.0 → full coverage (no edge AA on cover quad)
             color: [color.r, color.g, color.b, color.a],
             world_pos: [0.0, 0.0],
             paint_index,
@@ -933,9 +905,14 @@ fn append_fill_contour_geometry(
 
     let mut total_edge_verts = 0u32;
     for (i, cubic) in contour.contour.cubics.iter().enumerate() {
-        let seg_count =
-            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
-                .max(MIN_FILL_CUBIC_SEGMENTS);
+        let seg_count = wang_cubic_segment_count(
+            cubic[0],
+            cubic[1],
+            cubic[2],
+            cubic[3],
+            RIVE_PARAMETRIC_PRECISION,
+        )
+        .max(MIN_FILL_CUBIC_SEGMENTS);
         total_edge_verts += if i == contour.contour.cubics.len() - 1 {
             seg_count + 1
         } else {
@@ -954,9 +931,14 @@ fn append_fill_contour_geometry(
 
     let mut edge_cursor = 0u32;
     for (i, cubic) in contour.contour.cubics.iter().enumerate() {
-        let seg_count =
-            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
-                .max(MIN_FILL_CUBIC_SEGMENTS);
+        let seg_count = wang_cubic_segment_count(
+            cubic[0],
+            cubic[1],
+            cubic[2],
+            cubic[3],
+            RIVE_PARAMETRIC_PRECISION,
+        )
+        .max(MIN_FILL_CUBIC_SEGMENTS);
         let edge_count = if i == contour.contour.cubics.len() - 1 {
             seg_count + 1
         } else {
@@ -999,29 +981,14 @@ fn contour_fill_samples(contour: &Contour) -> Vec<Vec2D> {
     }
 
     for cubic in &contour.cubics {
-        let seg_count =
-            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0).max(4);
-        for i in 1..=seg_count {
-            let t = i as f32 / seg_count as f32;
-            points.push(super::math::cubic_eval(
-                cubic[0], cubic[1], cubic[2], cubic[3], t,
-            ));
-        }
-    }
-
-    points
-}
-
-fn contour_edge_samples(contour: &Contour) -> Vec<Vec2D> {
-    let mut points = Vec::new();
-    if let Some(first) = contour.cubics.first() {
-        points.push(first[0]);
-    }
-
-    for cubic in &contour.cubics {
-        let seg_count =
-            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
-                .max(MIN_FILL_CUBIC_SEGMENTS);
+        let seg_count = wang_cubic_segment_count(
+            cubic[0],
+            cubic[1],
+            cubic[2],
+            cubic[3],
+            RIVE_PARAMETRIC_PRECISION,
+        )
+        .max(MIN_FILL_CUBIC_SEGMENTS);
         for i in 1..=seg_count {
             let t = i as f32 / seg_count as f32;
             points.push(super::math::cubic_eval(
@@ -1050,11 +1017,41 @@ fn contour_midpoint(contour: &Contour) -> Vec2D {
         return Vec2D::ZERO;
     }
 
-    let mut endpoints_sum = Vec2D::ZERO;
-    for cubic in &contour.cubics {
-        endpoints_sum = endpoints_sum + cubic[3];
+    // Use area-weighted centroid for stability on concave animated shapes.
+    // Falls back to simple average if the polygon is degenerate.
+    let endpoints: Vec<Vec2D> = contour.cubics.iter().map(|c| c[0]).collect();
+    let n = endpoints.len();
+    if n < 3 {
+        let mut sum = Vec2D::ZERO;
+        for p in &endpoints {
+            sum = sum + *p;
+        }
+        return sum * (1.0 / n.max(1) as f32);
     }
-    endpoints_sum * (1.0 / contour.cubics.len() as f32)
+
+    let mut area = 0.0f32;
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for i in 0..n {
+        let p0 = endpoints[i];
+        let p1 = endpoints[(i + 1) % n];
+        let cross = p0.cross(p1);
+        area += cross;
+        cx += (p0.x + p1.x) * cross;
+        cy += (p0.y + p1.y) * cross;
+    }
+    area *= 0.5;
+
+    if area.abs() < 1e-5 {
+        let mut sum = Vec2D::ZERO;
+        for p in &endpoints {
+            sum = sum + *p;
+        }
+        return sum * (1.0 / n as f32);
+    }
+
+    let factor = 1.0 / (6.0 * area);
+    Vec2D::new(cx * factor, cy * factor)
 }
 
 fn point_in_polygon_kernel_approx(points: &[Vec2D], p: Vec2D) -> bool {
@@ -1077,184 +1074,6 @@ fn segment_stays_inside_polygon(points: &[Vec2D], a: Vec2D, b: Vec2D) -> bool {
     true
 }
 
-fn cached_triangulate_polygon_indices(points: &[Vec2D]) -> Option<Vec<u32>> {
-    let key = polygon_cache_key(points);
-    let cache = triangulation_cache();
-
-    if let Some(cached) = cache.lock().ok()?.get(&key).cloned() {
-        return Some(cached);
-    }
-
-    let indices = triangulate_polygon_indices(points)?;
-
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() > 512 {
-            guard.clear();
-        }
-        guard.insert(key, indices.clone());
-    }
-
-    Some(indices)
-}
-
-fn triangulation_cache() -> &'static Mutex<HashMap<u64, Vec<u32>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<u32>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn polygon_cache_key(points: &[Vec2D]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    points.len().hash(&mut hasher);
-    for p in points {
-        p.x.to_bits().hash(&mut hasher);
-        p.y.to_bits().hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-fn triangulate_polygon_indices(points: &[Vec2D]) -> Option<Vec<u32>> {
-    let mut remaining = simplified_polygon_indices(points);
-    if remaining.len() < 3 {
-        return None;
-    }
-
-    let area = polygon_signed_area_by_indices(points, &remaining);
-    if area.abs() < 1e-3 {
-        return None;
-    }
-
-    let is_ccw = area > 0.0;
-    let mut indices = Vec::with_capacity((remaining.len() - 2) * 3);
-    let mut guard = remaining.len() * remaining.len();
-
-    while remaining.len() > 3 && guard > 0 {
-        guard -= 1;
-        let mut ear_found = false;
-
-        for i in 0..remaining.len() {
-            let prev = remaining[(i + remaining.len() - 1) % remaining.len()];
-            let curr = remaining[i];
-            let next = remaining[(i + 1) % remaining.len()];
-
-            if !is_polygon_ear(points, prev, curr, next, &remaining, is_ccw) {
-                continue;
-            }
-
-            indices.extend_from_slice(&[prev as u32, curr as u32, next as u32]);
-            remaining.remove(i);
-            ear_found = true;
-            break;
-        }
-
-        if !ear_found {
-            return None;
-        }
-    }
-
-    if remaining.len() == 3 {
-        indices.extend_from_slice(&[
-            remaining[0] as u32,
-            remaining[1] as u32,
-            remaining[2] as u32,
-        ]);
-    }
-
-    Some(indices)
-}
-
-fn simplified_polygon_indices(points: &[Vec2D]) -> Vec<usize> {
-    if points.is_empty() {
-        return Vec::new();
-    }
-
-    let mut filtered = Vec::with_capacity(points.len());
-    for i in 0..points.len() {
-        let prev = points[(i + points.len() - 1) % points.len()];
-        let curr = points[i];
-        if curr.distance(prev) > 1e-3 {
-            filtered.push(i);
-        }
-    }
-
-    let mut changed = true;
-    while changed && filtered.len() > 3 {
-        changed = false;
-        for i in 0..filtered.len() {
-            let prev = points[filtered[(i + filtered.len() - 1) % filtered.len()]];
-            let curr = points[filtered[i]];
-            let next = points[filtered[(i + 1) % filtered.len()]];
-            if triangle_cross(prev, curr, next).abs() <= 1e-4 {
-                filtered.remove(i);
-                changed = true;
-                break;
-            }
-        }
-    }
-
-    filtered
-}
-
-fn polygon_signed_area_by_indices(points: &[Vec2D], indices: &[usize]) -> f32 {
-    if indices.len() < 3 {
-        return 0.0;
-    }
-
-    let mut area = 0.0f32;
-    for i in 0..indices.len() {
-        let p0 = points[indices[i]];
-        let p1 = points[indices[(i + 1) % indices.len()]];
-        area += p0.cross(p1);
-    }
-    area * 0.5
-}
-
-fn is_polygon_ear(
-    points: &[Vec2D],
-    prev: usize,
-    curr: usize,
-    next: usize,
-    remaining: &[usize],
-    is_ccw: bool,
-) -> bool {
-    let a = points[prev];
-    let b = points[curr];
-    let c = points[next];
-    let cross = triangle_cross(a, b, c);
-
-    if is_ccw {
-        if cross <= 1e-5 {
-            return false;
-        }
-    } else if cross >= -1e-5 {
-        return false;
-    }
-
-    for &idx in remaining {
-        if idx == prev || idx == curr || idx == next {
-            continue;
-        }
-
-        if point_in_triangle(points[idx], a, b, c) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn triangle_cross(a: Vec2D, b: Vec2D, c: Vec2D) -> f32 {
-    (b - a).cross(c - a)
-}
-
-fn point_in_triangle(p: Vec2D, a: Vec2D, b: Vec2D, c: Vec2D) -> bool {
-    let ab = triangle_cross(a, b, p);
-    let bc = triangle_cross(b, c, p);
-    let ca = triangle_cross(c, a, p);
-    let has_neg = ab < -1e-5 || bc < -1e-5 || ca < -1e-5;
-    let has_pos = ab > 1e-5 || bc > 1e-5 || ca > 1e-5;
-    !(has_neg && has_pos)
-}
-
 fn polygon_signed_area(points: &[Vec2D]) -> f32 {
     if points.len() < 3 {
         return 0.0;
@@ -1267,29 +1086,6 @@ fn polygon_signed_area(points: &[Vec2D]) -> f32 {
         area += p0.cross(p1);
     }
     area * 0.5
-}
-
-fn polygon_centroid(points: &[Vec2D]) -> Vec2D {
-    let area = polygon_signed_area(points);
-    if area.abs() < 1e-5 {
-        let mut sum = Vec2D::ZERO;
-        for p in points {
-            sum = sum + *p;
-        }
-        return sum * (1.0 / points.len().max(1) as f32);
-    }
-
-    let mut cx = 0.0f32;
-    let mut cy = 0.0f32;
-    for i in 0..points.len() {
-        let p0 = points[i];
-        let p1 = points[(i + 1) % points.len()];
-        let cross = p0.cross(p1);
-        cx += (p0.x + p1.x) * cross;
-        cy += (p0.y + p1.y) * cross;
-    }
-    let factor = 1.0 / (6.0 * area);
-    Vec2D::new(cx * factor, cy * factor)
 }
 
 fn point_in_polygon(points: &[Vec2D], p: Vec2D) -> bool {
@@ -1322,117 +1118,13 @@ fn point_in_polygon(points: &[Vec2D], p: Vec2D) -> bool {
     inside
 }
 
-/// Rive-quality tessellation tolerance: 1/4 pixel (kParametricPrecision = 4).
-/// This matches Rive's parametric precision and produces smooth curves for
-/// small shapes like eyes, circles, and rounded corners.
-const FILL_TOLERANCE: f32 = 0.25;
-const MIN_FILL_CUBIC_SEGMENTS: u32 = 2;
-
-#[allow(dead_code)]
-fn lyon_fill_path(
-    path: &RawPath,
-    color: Color,
-    paint_index: u32,
-    opacity: f32,
-    fill_rule: crate::geometry::path::FillRule,
-    vertex_start: u32,
-    sprite_idx: u32,
-) -> (Vec<GpuVertex>, Vec<u32>) {
-    use lyon::math::point;
-    use lyon::path::Path;
-    use lyon::tessellation::{
-        BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers,
-    };
-
-    let mut builder = Path::builder();
-    let mut point_idx = 0;
-    let mut has_open = false;
-
-    for verb in &path.verbs {
-        match verb {
-            PathVerb::Move => {
-                if has_open {
-                    builder.end(false);
-                }
-                let p = path.points[point_idx];
-                builder.begin(point(p.x, p.y));
-                has_open = true;
-                point_idx += 1;
-            }
-            PathVerb::Line => {
-                let p = path.points[point_idx];
-                builder.line_to(point(p.x, p.y));
-                point_idx += 1;
-            }
-            PathVerb::Quad => {
-                let c = path.points[point_idx];
-                let e = path.points[point_idx + 1];
-                builder.quadratic_bezier_to(point(c.x, c.y), point(e.x, e.y));
-                point_idx += 2;
-            }
-            PathVerb::Cubic => {
-                let c1 = path.points[point_idx];
-                let c2 = path.points[point_idx + 1];
-                let e = path.points[point_idx + 2];
-                builder.cubic_bezier_to(point(c1.x, c1.y), point(c2.x, c2.y), point(e.x, e.y));
-                point_idx += 3;
-            }
-            PathVerb::Close => {
-                if has_open {
-                    builder.end(true);
-                    has_open = false;
-                }
-            }
-        }
-    }
-    if has_open {
-        builder.end(false);
-    }
-
-    let lyon_path = builder.build();
-
-    let lyon_rule = match fill_rule {
-        crate::geometry::path::FillRule::EvenOdd => lyon::tessellation::FillRule::EvenOdd,
-        crate::geometry::path::FillRule::NonZero => lyon::tessellation::FillRule::NonZero,
-    };
-
-    let r = color.r;
-    let g = color.g;
-    let b = color.b;
-    let a = color.a * opacity;
-
-    let mut tessellator = FillTessellator::new();
-    let mut geometry: VertexBuffers<GpuVertex, u32> = VertexBuffers::new();
-
-    {
-        let mut buf_builder = BuffersBuilder::new(&mut geometry, |vertex: FillVertex| {
-            let pos = vertex.position();
-            GpuVertex {
-                position: [pos.x, pos.y],
-                uv: [0.0, 0.0],
-                color: [r, g, b, a],
-                world_pos: [0.0, 0.0], // computed in vertex shader
-                paint_index,
-                sprite_index: sprite_idx,
-            }
-        });
-        let _ = tessellator.tessellate_path(
-            &lyon_path,
-            &FillOptions::default()
-                .with_fill_rule(lyon_rule)
-                .with_tolerance(FILL_TOLERANCE),
-            &mut buf_builder,
-        );
-    }
-
-    let indices: Vec<u32> = geometry
-        .indices
-        .iter()
-        .map(|&i| i as u32 + vertex_start)
-        .collect();
-
-    (geometry.vertices, indices)
-}
+/// Rive-quality tessellation precision (kParametricPrecision = 4).
+/// Higher value = more segments = smoother curves.
+/// 4.0 produces quarter-pixel accuracy, matching Rive's default.
+const RIVE_PARAMETRIC_PRECISION: f32 = 4.0;
+/// Minimum segments per cubic — Rive never drops below a reasonable floor.
+/// 4 ensures even tiny near-linear cubics get enough segments for smooth AA.
+const MIN_FILL_CUBIC_SEGMENTS: u32 = 4;
 
 // ─── Contour extraction ─────────────────────────────────────
 
@@ -1537,9 +1229,14 @@ fn encode_stroke_contour(
     let mut total_pairs: u32 = 0;
 
     for (i, cubic) in contour.cubics.iter().enumerate() {
-        let seg_count =
-            wang_cubic_segment_count(cubic[0], cubic[1], cubic[2], cubic[3], 1.0)
-                .max(1);
+        let seg_count = wang_cubic_segment_count(
+            cubic[0],
+            cubic[1],
+            cubic[2],
+            cubic[3],
+            RIVE_PARAMETRIC_PRECISION,
+        )
+        .max(1);
 
         let is_last = i == contour.cubics.len() - 1;
         let num_new = if is_last { seg_count + 1 } else { seg_count };
@@ -1816,28 +1513,15 @@ mod tests {
     }
 
     #[test]
-    fn triangulates_concave_polygon() {
-        let polygon = vec![
-            Vec2D::new(0.0, 0.0),
-            Vec2D::new(4.0, 0.0),
-            Vec2D::new(4.0, 2.0),
-            Vec2D::new(2.0, 1.0),
-            Vec2D::new(4.0, 4.0),
-            Vec2D::new(0.0, 4.0),
-        ];
-
-        let indices =
-            triangulate_polygon_indices(&polygon).expect("concave polygon should triangulate");
-        assert_eq!(indices.len(), 12);
-    }
-
-    #[test]
     fn preserves_draw_order_across_simple_and_complex_fills() {
         let mut simple = RawPath::new();
         simple.add_rect(10.0, 10.0, 12.0, 12.0);
 
         let encoded = encode_paths_instanced(
-            &[(0, vec![solid_fill(concave_path()), solid_fill(simple.clone())])],
+            &[(
+                0,
+                vec![solid_fill(concave_path()), solid_fill(simple.clone())],
+            )],
             &[Mat2D::identity()],
             false,
         );
@@ -1871,4 +1555,3 @@ mod tests {
         assert!(matches!(reversed.ordered_draws[1], EncodedDraw::Complex(_)));
     }
 }
-

@@ -340,27 +340,6 @@ pub fn create_fill_tessellate_pipeline(device: &Device) -> ComputePipeline {
         cache: None,
     })
 }
-pub fn create_fill_topology_pipeline(device: &Device) -> ComputePipeline {
-    let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("fill topology compute shader"),
-        source: ShaderSource::Wgsl(include_str!("shaders/fill_tess.wgsl").into()),
-    });
-
-    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("fill topology pipeline layout"),
-        bind_group_layouts: &[&create_fill_tessellate_bind_group_layout(device)],
-        push_constant_ranges: &[],
-    });
-
-    device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("fill topology compute pipeline"),
-        layout: Some(&layout),
-        module: &shader,
-        entry_point: Some("cs_fill_topology"),
-        compilation_options: Default::default(),
-        cache: None,
-    })
-}
 
 /// Bind group layout: FillTessUniforms (uniform), GpuFillContour[] (read),
 /// GpuFillCubic[] (read), GpuVertex[] (read_write), index buffer (read_write).

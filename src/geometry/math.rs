@@ -352,14 +352,20 @@ pub fn cubic_tangents(p0: Vec2D, p1: Vec2D, p2: Vec2D, p3: Vec2D) -> (Vec2D, Vec
     (tan0, tan1)
 }
 
-/// Wang's formula for cubic bezier segment count estimation
-/// Based on Rive's tessellation approach
+/// Wang's formula for cubic bezier segment count estimation.
+/// `precision` controls tessellation density:
+///   Rive uses kParametricPrecision = 4 (quarter-pixel tolerance → smooth curves).
+///   A value of 1.0 means ~1 pixel tolerance (coarse), 4.0 means ~¼ pixel (Rive quality).
 pub fn wang_cubic_segment_count(p0: Vec2D, p1: Vec2D, p2: Vec2D, p3: Vec2D, precision: f32) -> u32 {
     let d0 = p0 - p1 * 2.0 + p2;
     let d1 = p1 - p2 * 2.0 + p3;
     let m = d0.length_sq().max(d1.length_sq());
-    let n = (0.75 * 4.0 * m.sqrt()).sqrt().ceil().max(1.0);
-    (n * precision).min(1024.0) as u32
+    // Wang's formula: n = ceil(sqrt(3/4 * |max second derivative| * precision))
+    let n = (0.75 * precision * precision * 4.0 * m.sqrt())
+        .sqrt()
+        .ceil()
+        .max(1.0);
+    (n).min(1024.0) as u32
 }
 
 /// Evaluate cubic bezier at parameter t using De Casteljau's algorithm (Rive-style)

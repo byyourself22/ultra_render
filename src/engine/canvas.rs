@@ -78,13 +78,20 @@ impl UltraCanvas {
         }
     }
 
-    pub fn update(&mut self, delta_seconds: f32, prefer_synced_batching: bool) {
+    /// Advance all sprites. When multiple sprites share the same animation,
+    /// the master sprite is advanced and all others sync from it (Rive-style).
+    /// This ensures identical geometry → single tessellation → single draw call.
+    pub fn update(&mut self, delta_seconds: f32) {
         if self.sprites.is_empty() {
             return;
         }
 
-        if prefer_synced_batching && self.sprites.len() > 1 && self.supports_synced_update() {
-            let master_idx = self.sprites.iter().position(|sprite| sprite.visible).unwrap_or(0);
+        if self.sprites.len() > 1 && self.supports_synced_update() {
+            let master_idx = self
+                .sprites
+                .iter()
+                .position(|sprite| sprite.visible)
+                .unwrap_or(0);
             let (before_master, master_and_after) = self.sprites.split_at_mut(master_idx);
             let (master, after_master) = master_and_after.split_first_mut().expect("non-empty");
 
@@ -224,4 +231,3 @@ impl UltraCanvas {
         self.sprites.len()
     }
 }
-

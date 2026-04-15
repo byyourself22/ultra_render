@@ -1,6 +1,6 @@
 //! Shared application struct for both native and web targets.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -23,8 +23,17 @@ pub static STAT_ANIM_FRAMES: AtomicU32 = AtomicU32::new(0); // total frames × 1
 pub static STAT_SUBFRAMES: AtomicU32 = AtomicU32::new(0); // render frames per anim frame × 10
 pub static STAT_TESS_UNIQUE: AtomicU32 = AtomicU32::new(0); // unique tessellations this frame
 pub static TARGET_SPRITES: AtomicU32 = AtomicU32::new(1);
-/// When true, all spawned sprites share animation time (offset = 0 → potential batching).
-pub static BATCH_SYNCED: AtomicBool = AtomicBool::new(false);
+
+// Zoom/pan state — stored as f32 bit patterns in AtomicU32.
+// Zoom default = 1.0, pan default = 0.0.
+pub static ZOOM_LEVEL: AtomicU32 = AtomicU32::new(0x3F800000); // 1.0f32.to_bits()
+pub static PAN_X: AtomicU32 = AtomicU32::new(0); // 0.0f32.to_bits()
+pub static PAN_Y: AtomicU32 = AtomicU32::new(0); // 0.0f32.to_bits()
+
+/// Rolling window size for stable FPS measurement.
+/// 120 frames ≈ ~0.8s at 144 Hz — large enough to eliminate sub-frame
+/// oscillation, small enough to react to real performance changes.
+const FPS_WINDOW_SIZE: usize = 120;
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -38,8 +47,13 @@ pub struct App {
     frame_count: u64,
     fps_timer: f64,
     fps_frame_count: u32,
+    /// Rolling window of recent frame delta-times for stable FPS calculation.
+    /// Rive-style: measure over a fixed window instead of EMA to avoid jitter.
+    frame_times: Vec<f32>,
+    frame_time_cursor: usize,
+    frame_time_sum: f32,
+    frame_time_count: usize,
     smoothed_fps: f32,
-    last_batch_synced: bool,
 }
 
 impl App {
@@ -57,8 +71,11 @@ impl App {
             frame_count: 0,
             fps_timer: now,
             fps_frame_count: 0,
+            frame_times: vec![0.0; FPS_WINDOW_SIZE],
+            frame_time_cursor: 0,
+            frame_time_sum: 0.0,
+            frame_time_count: 0,
             smoothed_fps: 0.0,
-            last_batch_synced: BATCH_SYNCED.load(Ordering::Relaxed),
         }
     }
 
@@ -77,8 +94,11 @@ impl App {
             frame_count: 0,
             fps_timer: now,
             fps_frame_count: 0,
+            frame_times: vec![0.0; FPS_WINDOW_SIZE],
+            frame_time_cursor: 0,
+            frame_time_sum: 0.0,
+            frame_time_count: 0,
             smoothed_fps: 0.0,
-            last_batch_synced: BATCH_SYNCED.load(Ordering::Relaxed),
         }
     }
 
@@ -138,35 +158,6 @@ impl App {
         }
     }
 
-    fn sync_batch_mode(&mut self) {
-        let synced = BATCH_SYNCED.load(Ordering::Relaxed);
-        if synced == self.last_batch_synced {
-            return;
-        }
-
-        if let Some(canvas) = &mut self.ultra_canvas {
-            if let Some((first, rest)) = canvas.sprites.split_first_mut() {
-                if synced {
-                    for sprite in rest {
-                        sprite.artboard.sync_playback_from(&first.artboard);
-                    }
-                } else {
-                    let duration = (first.artboard.player.out_point - first.artboard.player.in_point)
-                        .max(1.0);
-                    for (idx, sprite) in rest.iter_mut().enumerate() {
-                        let offset = ((idx + 1) as f32 * 0.3) % duration;
-                        sprite
-                            .artboard
-                            .seek_frame(first.artboard.player.in_point + offset);
-                        sprite.artboard.play();
-                    }
-                }
-            }
-        }
-
-        self.last_batch_synced = synced;
-    }
-
     fn sync_sprite_count(&mut self) {
         let canvas = match self.ultra_canvas.as_mut() {
             Some(c) => c,
@@ -181,7 +172,6 @@ impl App {
 
         let w = canvas.viewport_width;
         let h = canvas.viewport_height;
-        let synced = BATCH_SYNCED.load(Ordering::Relaxed);
 
         if target > current {
             if let Some(first) = canvas.sprites.first().cloned() {
@@ -199,16 +189,9 @@ impl App {
                     let x = col as f32 * cell_w + (cell_w - first.composition_width * scale) * 0.5;
                     let y = row as f32 * cell_h + (cell_h - first.composition_height * scale) * 0.5;
 
+                    // Always synced — same frame → single tessellation → single draw call
                     let mut new_sprite = first.artboard.clone();
-                    if synced {
-                        // Keep animation time identical → same geometry → batchable
-                        new_sprite.player.seek(first.artboard.player.frame);
-                    } else {
-                        // Offset each sprite so they animate at different phases
-                        let dur = new_sprite.player.out_point - new_sprite.player.in_point;
-                        let offset = (idx as f32 * 0.3) % dur.max(1.0);
-                        new_sprite.player.seek(new_sprite.player.in_point + offset);
-                    }
+                    new_sprite.player.seek(first.artboard.player.frame);
                     new_sprite.player.play();
 
                     let mut sprite = crate::scene::sprite::Sprite::new(0, new_sprite);
@@ -273,7 +256,7 @@ impl App {
 
     fn prime_first_frame(&mut self) {
         if let Some(canvas) = &mut self.ultra_canvas {
-            canvas.update(0.0, BATCH_SYNCED.load(Ordering::Relaxed));
+            canvas.update(0.0);
         }
     }
 
@@ -354,7 +337,13 @@ fn now_seconds() -> f64 {
 
 #[cfg(feature = "web")]
 fn now_seconds() -> f64 {
-    js_sys::Date::now() / 1000.0
+    // Use performance.now() for high-precision monotonic timing.
+    // js_sys::Date::now() has millisecond precision and can drift,
+    // causing FPS oscillation.
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now() / 1000.0)
+        .unwrap_or_else(|| js_sys::Date::now() / 1000.0)
 }
 
 // ─── Event handler ──────────────────────────────────────────
@@ -491,13 +480,24 @@ impl ApplicationHandler for App {
                 let raw_dt = ((now - self.last_time) as f32).max(0.0);
                 self.last_time = now;
 
+                // Rolling-window FPS (Rive-style): accumulate frame times in a
+                // fixed-size ring buffer. FPS = count / sum. This eliminates
+                // the EMA feedback loop that caused 142↔144 FPS oscillation.
                 let sample_dt = raw_dt.clamp(1.0 / 1000.0, 0.1);
-                let instant_fps = 1.0 / sample_dt;
-                if self.smoothed_fps <= 0.0 {
-                    self.smoothed_fps = instant_fps;
-                } else {
-                    let alpha = (sample_dt * 12.0).clamp(0.05, 0.25);
-                    self.smoothed_fps += (instant_fps - self.smoothed_fps) * alpha;
+                {
+                    let idx = self.frame_time_cursor;
+                    self.frame_time_sum -= self.frame_times[idx];
+                    self.frame_times[idx] = sample_dt;
+                    self.frame_time_sum += sample_dt;
+                    self.frame_time_cursor = (idx + 1) % FPS_WINDOW_SIZE;
+                    if self.frame_time_count < FPS_WINDOW_SIZE {
+                        self.frame_time_count += 1;
+                    }
+                    self.smoothed_fps = if self.frame_time_sum > 0.0 {
+                        self.frame_time_count as f32 / self.frame_time_sum
+                    } else {
+                        0.0
+                    };
                 }
                 STAT_FPS.store((self.smoothed_fps * 10.0) as u32, Ordering::Relaxed);
 
@@ -505,10 +505,26 @@ impl ApplicationHandler for App {
                 let dt = raw_dt.min(0.1);
 
                 self.sync_sprite_count();
-                self.sync_batch_mode();
+
+                // Read zoom/pan state for this frame
+                let zoom = f32::from_bits(ZOOM_LEVEL.load(Ordering::Relaxed)).clamp(0.1, 20.0);
+                let pan_x = f32::from_bits(PAN_X.load(Ordering::Relaxed));
+                let pan_y = f32::from_bits(PAN_Y.load(Ordering::Relaxed));
+
+                // Update view bounds for zoom/pan-aware visibility culling
+                if let Some(canvas) = &mut self.ultra_canvas {
+                    let w = canvas.viewport_width;
+                    let h = canvas.viewport_height;
+                    let cx = w * 0.5 + pan_x;
+                    let cy = h * 0.5 + pan_y;
+                    let hvw = w / (2.0 * zoom);
+                    let hvh = h / (2.0 * zoom);
+                    canvas.view_bounds =
+                        crate::geometry::math::AABB::new(cx - hvw, cy - hvh, cx + hvw, cy + hvh);
+                }
 
                 if let Some(canvas) = &mut self.ultra_canvas {
-                    canvas.update(dt, BATCH_SYNCED.load(Ordering::Relaxed));
+                    canvas.update(dt);
                 }
 
                 // Publish current animation frame + subframe stats.
@@ -559,6 +575,9 @@ impl ApplicationHandler for App {
                         geometry_stamp,
                         transforms.len() as u32,
                         time,
+                        zoom,
+                        pan_x,
+                        pan_y,
                     ) {
                         Ok(_) => {
                             gpu_draw_calls = rc.gpu_draw_call_count();
@@ -604,7 +623,6 @@ impl ApplicationHandler for App {
                     self.fps_frame_count = 0;
                     self.fps_timer = now;
                 }
-
             }
             _ => {}
         }
@@ -627,5 +645,3 @@ async fn fetch_animation(url: &str) -> Result<String, wasm_bindgen::JsValue> {
     let text = JsFuture::from(resp.text()?).await?;
     Ok(text.as_string().unwrap_or_default())
 }
-
-

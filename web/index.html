@@ -6,70 +6,81 @@
   <title>UltraRender - Lottie WebGPU</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1e; }
-    canvas { display: block; width: 100%; height: 100vh; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #111114; }
+    canvas { display: block; width: 100%; height: 100vh; cursor: grab; }
 
     #stats {
       position: fixed;
-      top: 10px; left: 10px;
-      color: #0f0;
-      font: 12px/1.7 monospace;
-      background: rgba(0,0,0,0.78);
-      padding: 8px 12px;
-      border-radius: 6px;
+      top: 12px; left: 12px;
+      color: #ccc;
+      font: 11px/1.6 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+      background: rgba(0,0,0,0.82);
+      padding: 10px 14px;
+      border-radius: 8px;
       pointer-events: none;
       z-index: 100;
-      min-width: 200px;
-      border: 1px solid rgba(0,255,0,0.2);
+      min-width: 180px;
+      border: 1px solid rgba(255,255,255,0.08);
+      backdrop-filter: blur(8px);
     }
-    #stats .label { color: #888; font-size: 11px; }
-    #stats .value { color: #0f0; font-weight: bold; }
-    #stats .value.yellow { color: #ff0; }
-    #stats .value.cyan   { color: #0ff; }
-    #stats .sep { border-top: 1px solid rgba(255,255,255,0.1); margin: 4px 0; }
-    #stats .row { display: flex; justify-content: space-between; gap: 8px; }
+    #stats .title {
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    #stats .sep { border-top: 1px solid rgba(255,255,255,0.06); margin: 5px 0; }
+    #stats .row { display: flex; justify-content: space-between; gap: 12px; }
+    #stats .label { color: #666; }
+    #stats .val { color: #0f0; font-weight: 500; }
+    #stats .val.y { color: #fd0; }
+    #stats .val.c { color: #0df; }
+    #stats .val.w { color: #fff; }
 
     #controls {
       position: fixed;
       bottom: 16px; left: 50%;
       transform: translateX(-50%);
       display: flex;
-      flex-direction: column;
-      align-items: center;
       gap: 6px;
       z-index: 100;
     }
-    .ctrl-row {
-      display: flex;
-      gap: 6px;
-      background: rgba(0,0,0,0.75);
-      padding: 8px 12px;
+    .panel {
+      background: rgba(0,0,0,0.8);
+      padding: 8px 10px;
       border-radius: 8px;
-      border: 1px solid rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.08);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
-    .ctrl-row button {
-      background: rgba(255,255,255,0.08);
-      color: #eee;
-      border: 1px solid rgba(255,255,255,0.2);
-      border-radius: 4px;
-      padding: 5px 12px;
+    .panel-label {
+      color: #666;
+      font: 10px/1 monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    button {
+      background: rgba(255,255,255,0.06);
+      color: #ddd;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 5px;
+      padding: 5px 10px;
       cursor: pointer;
-      font: 12px monospace;
-      transition: background 0.15s;
+      font: 11px monospace;
+      transition: all 0.12s;
       white-space: nowrap;
     }
-    .ctrl-row button:hover  { background: rgba(255,255,255,0.18); }
-    .ctrl-row button:active { background: rgba(255,255,255,0.28); }
-    .ctrl-row button.synced {
-      border-color: #0ff;
-      color: #0ff;
-    }
-    .sprite-count {
+    button:hover { background: rgba(255,255,255,0.14); color: #fff; }
+    button:active { background: rgba(255,255,255,0.22); }
+    button.active { border-color: #0df; color: #0df; }
+    .count-display {
       color: #fff;
-      font: 13px monospace;
-      line-height: 2;
-      padding: 0 6px;
-      min-width: 28px;
+      font: 13px/1 monospace;
+      font-weight: 600;
+      min-width: 32px;
       text-align: center;
     }
 
@@ -79,11 +90,11 @@
       top: 50%; left: 50%;
       transform: translate(-50%, -50%);
       color: #fff;
-      font: 18px sans-serif;
+      font: 16px system-ui, sans-serif;
       text-align: center;
-      background: rgba(200,50,50,0.9);
-      padding: 30px;
-      border-radius: 10px;
+      background: rgba(200,40,40,0.92);
+      padding: 28px 36px;
+      border-radius: 12px;
     }
   </style>
 </head>
@@ -91,58 +102,61 @@
   <canvas id="ultra-canvas"></canvas>
 
   <div id="stats">
-    <div class="label">UltraRender WebGPU</div>
+    <div class="title">UltraRender WebGPU</div>
     <div class="sep"></div>
     <div class="row">
       <span class="label">FPS</span>
-      <span class="value" id="stat-fps">—</span>
+      <span class="val" id="s-fps">--</span>
     </div>
     <div class="row">
-      <span class="label">Draws</span>
-      <span class="value yellow" id="stat-draws">—</span>
+      <span class="label">Draw calls</span>
+      <span class="val y" id="s-draws">--</span>
     </div>
     <div class="row">
       <span class="label">Sprites</span>
-      <span class="value" id="stat-sprites">—</span>
+      <span class="val w" id="s-sprites">--</span>
     </div>
     <div class="sep"></div>
     <div class="row">
-      <span class="label">Anim Hz</span>
-      <span class="value cyan" id="stat-anim-fps">—</span>
+      <span class="label">Anim</span>
+      <span class="val c" id="s-anim">--</span>
     </div>
     <div class="row">
       <span class="label">Frame</span>
-      <span class="value cyan" id="stat-anim-frame">—</span>
+      <span class="val c" id="s-frame">--</span>
     </div>
     <div class="row">
       <span class="label">Subframes</span>
-      <span class="value cyan" id="stat-subframes">—</span>
+      <span class="val c" id="s-sub">--</span>
     </div>
     <div class="row">
-      <span class="label">Tess unique</span>
-      <span class="value yellow" id="stat-tess-unique">—</span>
+      <span class="label">Tessellations</span>
+      <span class="val y" id="s-tess">--</span>
     </div>
     <div class="row">
-      <span class="label">Mode</span>
-      <span class="value" id="stat-mode">unbatch</span>
+      <span class="label">Zoom</span>
+      <span class="val w" id="s-zoom">1.0x</span>
     </div>
     <div class="sep"></div>
-    <div class="label" id="stat-status">Initializing…</div>
+    <div class="label" id="s-status">Initializing...</div>
   </div>
 
   <div id="controls">
-    <!-- Row 1: sprite count -->
-    <div class="ctrl-row">
-      <button id="btn-less">− 1</button>
-      <span class="sprite-count" id="ctrl-count">1</span>
-      <button id="btn-more">+ 1</button>
+    <!-- Sprites -->
+    <div class="panel">
+      <button id="b-sub1">&minus;</button>
+      <span class="count-display" id="c-count">1</span>
+      <button id="b-add1">+</button>
+      <button id="b-10">+10</button>
+      <button id="b-100">+100</button>
+      <button id="b-1k">+1k</button>
+      <button id="b-reset" title="Reset to 1 sprite">1</button>
     </div>
-    <!-- Row 2: batch spawn -->
-    <div class="ctrl-row">
-      <button id="btn-batch-10" title="Spawn 10 synced sprites (same frame = 1 draw batch)">+10 Batch</button>
-      <button id="btn-unbatch-10" title="Spawn 10 unsynced sprites (offset frames)">+10 Unbatch</button>
-      <button id="btn-batch-100" title="Spawn 100 synced sprites">+100 Batch</button>
-      <button id="btn-unbatch-100" title="Spawn 100 unsynced sprites">+100 Unbatch</button>
+    <div class="panel">
+      <span class="panel-label">view</span>
+      <button id="b-zoom-in" title="Zoom in">+</button>
+      <button id="b-zoom-out" title="Zoom out">&minus;</button>
+      <button id="b-view-reset" title="Reset zoom/pan (R)">Reset</button>
     </div>
   </div>
 

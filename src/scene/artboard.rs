@@ -54,10 +54,10 @@ bitflags::bitflags! {
 pub struct ArtboardNode {
     pub name: String,
     pub node_type: NodeType,
-    pub parent_idx: Option<usize>,      // Transform parent in the node array
+    pub parent_idx: Option<usize>, // Transform parent in the node array
     pub draw_parent_idx: Option<usize>, // Draw-order owner (root or precomp)
-    pub lottie_parent: Option<i32>,     // Lottie parent layer index
-    pub lottie_index: Option<i32>,      // Lottie layer index
+    pub lottie_parent: Option<i32>, // Lottie parent layer index
+    pub lottie_index: Option<i32>, // Lottie layer index
     pub dirt: ComponentDirt,
     pub depth: u32, // DAG depth for topological ordering
     pub transform: ComputedTransform,
@@ -300,15 +300,26 @@ impl Artboard {
                 continue;
             };
 
-            // Compute effective frame considering parent precomp timing
-            let eff_frame = if let Some(parent_idx) = self.nodes[idx].parent_idx {
-                if let Some(parent_data) = &self.nodes[parent_idx].layer_data {
-                    (frame - parent_data.start_time) / parent_data.stretch
-                } else {
-                    frame
+            // Compute effective frame considering parent precomp timing.
+            // ONLY precomp parents create a new timing context (Lottie spec / ThorVG).
+            // Regular transform parents (via `parent` field) share the same timeline —
+            // they do NOT remap time. This fixes gfunny.json where chin (parent=upper_face)
+            // was incorrectly getting time-remapped through a non-precomp parent.
+            let eff_frame = {
+                let mut eff = frame;
+                let mut current = idx;
+                while let Some(pi) = self.nodes[current].parent_idx {
+                    if pi == 0 {
+                        break;
+                    }
+                    if let Some(pd) = &self.nodes[pi].layer_data {
+                        if pd.layer_type == LayerType::Precomp {
+                            eff = (eff - pd.start_time) / pd.stretch;
+                        }
+                    }
+                    current = pi;
                 }
-            } else {
-                frame
+                eff
             };
 
             let local_frame = (eff_frame - start_time) / stretch;
@@ -578,7 +589,11 @@ fn resolve_parent_indices(nodes: &mut [ArtboardNode]) {
             let found = nodes.iter().enumerate().find(|(j, n)| {
                 *j != i && n.lottie_index == Some(lottie_parent) && scope_parents[*j] == my_scope
             });
-            nodes[i].parent_idx = Some(found.map(|(parent_node_idx, _)| parent_node_idx).unwrap_or(fallback_parent));
+            nodes[i].parent_idx = Some(
+                found
+                    .map(|(parent_node_idx, _)| parent_node_idx)
+                    .unwrap_or(fallback_parent),
+            );
         } else {
             nodes[i].parent_idx = Some(fallback_parent);
         }
@@ -1128,7 +1143,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_parented_layers_keep_global_draw_order() {
         let mut child = make_shape_layer(
@@ -1190,14 +1204,3 @@ mod tests {
         assert!(k2 > k1);
     }
 }
-
-
-
-
-
-
-
-
-
-
-

@@ -10,132 +10,188 @@ interface WasmModule {
   get_anim_total_frames: () => number;
   get_subframes: () => number;
   get_tess_unique: () => number;
-  get_stats_json: () => string;
   request_sprite_count: (n: number) => void;
-  set_batch_synced: (synced: boolean) => void;
-  get_batch_synced: () => boolean;
-  add_sprites_batched: (n: number) => void;
-  add_sprites_unbatched: (n: number) => void;
+  add_sprites: (n: number) => void;
+  set_zoom: (zoom: number) => void;
+  set_pan: (x: number, y: number) => void;
+  get_zoom: () => number;
 }
 
 async function main() {
-  const statFps        = document.getElementById('stat-fps')!;
-  const statDraws      = document.getElementById('stat-draws')!;
-  const statSprites    = document.getElementById('stat-sprites')!;
-  const statAnimFps    = document.getElementById('stat-anim-fps')!;
-  const statAnimFrame  = document.getElementById('stat-anim-frame')!;
-  const statSubframes  = document.getElementById('stat-subframes')!;
-  const statTessUnique = document.getElementById('stat-tess-unique')!;
-  const statMode       = document.getElementById('stat-mode')!;
-  const statStatus     = document.getElementById('stat-status')!;
-  const ctrlCount     = document.getElementById('ctrl-count')!;
-  const btnLess       = document.getElementById('btn-less')! as HTMLButtonElement;
-  const btnMore       = document.getElementById('btn-more')! as HTMLButtonElement;
-  const btnBatch10    = document.getElementById('btn-batch-10')! as HTMLButtonElement;
-  const btnUnbatch10  = document.getElementById('btn-unbatch-10')! as HTMLButtonElement;
-  const btnBatch100   = document.getElementById('btn-batch-100')! as HTMLButtonElement;
-  const btnUnbatch100 = document.getElementById('btn-unbatch-100')! as HTMLButtonElement;
-  const noWebGPU      = document.getElementById('no-webgpu')!;
+  const sFps     = document.getElementById('s-fps')!;
+  const sDraws   = document.getElementById('s-draws')!;
+  const sSprites = document.getElementById('s-sprites')!;
+  const sAnim    = document.getElementById('s-anim')!;
+  const sFrame   = document.getElementById('s-frame')!;
+  const sSub     = document.getElementById('s-sub')!;
+  const sTess    = document.getElementById('s-tess')!;
+  const sZoom    = document.getElementById('s-zoom')!;
+  const sStatus  = document.getElementById('s-status')!;
+  const cCount   = document.getElementById('c-count')!;
+  const noWebGPU = document.getElementById('no-webgpu')!;
 
-  // Ensure canvas pixel dimensions match the window before WASM loads
+  // Sync canvas pixel dimensions before WASM loads
   const canvas = document.getElementById('ultra-canvas') as HTMLCanvasElement;
-  const syncCanvasSize = () => {
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight;
+  const syncSize = () => {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = Math.round(window.innerWidth * dpr);
+    canvas.height = Math.round(window.innerHeight * dpr);
   };
-  syncCanvasSize();
-  window.addEventListener('resize', syncCanvasSize);
+  syncSize();
+  window.addEventListener('resize', syncSize);
 
   if (!(navigator as any).gpu) {
     noWebGPU.style.display = 'block';
-    statStatus.textContent = 'WebGPU not supported';
+    sStatus.textContent = 'WebGPU not supported';
     return;
   }
 
-  statStatus.textContent = 'Initializing WebGPU…';
+  sStatus.textContent = 'Initializing WebGPU...';
 
   let wasm: WasmModule | null = null;
-  let targetSprites = 1;
+  let target = 1;
 
   try {
     // @ts-ignore
     wasm = await import('../../pkg/ultra_render.js') as WasmModule;
     await wasm.default();
-    statStatus.textContent = 'Running';
+    sStatus.textContent = 'Running';
   } catch (e) {
-    console.error('Failed to initialize UltraRender:', e);
-    statStatus.textContent = `Error: ${e}`;
-    (document.getElementById('stats')! as HTMLElement).style.color = '#f55';
+    console.error('UltraRender init failed:', e);
+    sStatus.textContent = `Error: ${e}`;
     return;
   }
 
-  // ── Sprite count controls ──────────────────────────────────
+  // -- Sprite controls --
   function setTarget(n: number) {
-    targetSprites = Math.max(1, Math.min(256, n));
-    ctrlCount.textContent = String(targetSprites);
-    wasm?.request_sprite_count(targetSprites);
+    target = Math.max(1, n);
+    cCount.textContent = String(target);
+    wasm?.request_sprite_count(target);
   }
 
-  btnLess.addEventListener('click', () => setTarget(targetSprites - 1));
-  btnMore.addEventListener('click', () => setTarget(targetSprites + 1));
+  document.getElementById('b-sub1')!.addEventListener('click', () => setTarget(target - 1));
+  document.getElementById('b-add1')!.addEventListener('click', () => setTarget(target + 1));
+  document.getElementById('b-10')!.addEventListener('click', () => setTarget(target + 10));
+  document.getElementById('b-100')!.addEventListener('click', () => setTarget(target + 100));
+  document.getElementById('b-1k')!.addEventListener('click', () => setTarget(target + 1000));
+  document.getElementById('b-reset')!.addEventListener('click', () => setTarget(1));
 
-  btnBatch10.addEventListener('click', () => {
-    wasm?.add_sprites_batched(10);
-  });
-  btnUnbatch10.addEventListener('click', () => {
-    wasm?.add_sprites_unbatched(10);
-  });
-  btnBatch100.addEventListener('click', () => {
-    wasm?.add_sprites_batched(100);
-  });
-  btnUnbatch100.addEventListener('click', () => {
-    wasm?.add_sprites_unbatched(100);
+  // Keyboard shortcuts
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '=' || e.key === '+') setTarget(target + 1);
+    if (e.key === '-') setTarget(target - 1);
+    if (e.key === '1') setTarget(1);
+    if (e.key === '0') setTarget(target + 100);
+    if (e.key === 'r' || e.key === 'R') resetView();
   });
 
-  // ── Stats loop ─────────────────────────────────────────────
-  let jsFrames = 0;
-  let jsLastTime = performance.now();
-  let jsFps = 0;
+  // -- Zoom / Pan --
+  let zoom = 1.0;
+  let panX = 0.0;
+  let panY = 0.0;
+  let isPanning = false;
+  let lastMouseX = 0;
+  let lastMouseY = 0;
 
-  function statsLoop(now: number) {
-    jsFrames++;
-    const elapsed = now - jsLastTime;
-    if (elapsed >= 1000) {
-      jsFps = Math.round(jsFrames * 1000 / elapsed);
-      jsFrames = 0;
-      jsLastTime = now;
+  function applyView() {
+    wasm?.set_zoom(zoom);
+    wasm?.set_pan(panX, panY);
+  }
+
+  function resetView() {
+    zoom = 1.0;
+    panX = 0.0;
+    panY = 0.0;
+    applyView();
+  }
+
+  function zoomBy(factor: number, centerX?: number, centerY?: number) {
+    const newZoom = Math.max(0.1, Math.min(20.0, zoom * factor));
+    if (centerX !== undefined && centerY !== undefined) {
+      const w = canvas.width;
+      const h = canvas.height;
+      panX += (centerX - w / 2) * (1 / zoom - 1 / newZoom);
+      panY += (centerY - h / 2) * (1 / zoom - 1 / newZoom);
+    }
+    zoom = newZoom;
+    applyView();
+  }
+
+  // Mouse wheel → zoom to cursor
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const dpr = canvas.width / rect.width;
+    const mx = (e.clientX - rect.left) * dpr;
+    const my = (e.clientY - rect.top) * dpr;
+    const speed = e.ctrlKey ? 0.01 : 0.003;
+    const factor = Math.exp(-e.deltaY * speed);
+    zoomBy(factor, mx, my);
+  }, { passive: false });
+
+  // Drag to pan
+  canvas.addEventListener('mousedown', (e) => {
+    isPanning = true;
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    canvas.style.cursor = 'grabbing';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isPanning) return;
+    const dpr = canvas.width / canvas.getBoundingClientRect().width;
+    const dx = (e.clientX - lastMouseX) * dpr;
+    const dy = (e.clientY - lastMouseY) * dpr;
+    panX -= dx / zoom;
+    panY -= dy / zoom;
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    applyView();
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (isPanning) {
+      isPanning = false;
+      canvas.style.cursor = 'grab';
+    }
+  });
+
+  // Double-click to reset view
+  canvas.addEventListener('dblclick', resetView);
+
+  // View control buttons
+  document.getElementById('b-zoom-in')!.addEventListener('click', () => {
+    zoomBy(1.3, canvas.width / 2, canvas.height / 2);
+  });
+  document.getElementById('b-zoom-out')!.addEventListener('click', () => {
+    zoomBy(1 / 1.3, canvas.width / 2, canvas.height / 2);
+  });
+  document.getElementById('b-view-reset')!.addEventListener('click', resetView);
+
+  // -- Stats loop --
+  function statsLoop() {
+    if (!wasm) { requestAnimationFrame(statsLoop); return; }
+
+    const fps = wasm.get_fps();
+    const sprites = wasm.get_sprite_count();
+
+    sFps.textContent     = fps > 0 ? fps.toFixed(0) + ' fps' : '--';
+    sDraws.textContent   = String(wasm.get_draw_calls());
+    sSprites.textContent = String(sprites);
+
+    if (sprites > 0) {
+      cCount.textContent = String(sprites);
+      target = sprites;
     }
 
-    if (wasm) {
-      const wasmFps = wasm.get_fps();
-      const displayFps = wasmFps > 0 ? wasmFps.toFixed(0) : String(jsFps);
-      statFps.textContent       = displayFps + ' fps';
-      statDraws.textContent     = String(wasm.get_draw_calls());
-
-      const actualSprites = wasm.get_sprite_count();
-      statSprites.textContent   = String(actualSprites);
-      if (actualSprites > 0) {
-        ctrlCount.textContent = String(actualSprites);
-        targetSprites = actualSprites;
-      }
-
-      const animFps   = wasm.get_anim_fps();
-      const animFrame = wasm.get_anim_frame();
-      const animTotal = wasm.get_anim_total_frames();
-      statAnimFps.textContent   = animFps.toFixed(0) + ' Hz';
-      statAnimFrame.textContent = animFrame.toFixed(1) + ' / ' + animTotal.toFixed(0);
-
-      const subframes  = wasm.get_subframes();
-      const tessUnique = wasm.get_tess_unique();
-      statSubframes.textContent  = subframes.toFixed(1) + 'x';
-      statTessUnique.textContent = String(tessUnique);
-
-      const synced = wasm.get_batch_synced();
-      statMode.textContent = synced ? 'batch (synced)' : 'unbatch';
-      statMode.style.color = synced ? '#0ff' : '#0f0';
-    } else {
-      statFps.textContent = String(jsFps) + ' fps';
-    }
+    const animFps   = wasm.get_anim_fps();
+    const animFrame = wasm.get_anim_frame();
+    const animTotal = wasm.get_anim_total_frames();
+    sAnim.textContent  = animFps.toFixed(0) + ' Hz';
+    sFrame.textContent = animFrame.toFixed(1) + ' / ' + animTotal.toFixed(0);
+    sSub.textContent   = wasm.get_subframes().toFixed(1) + 'x';
+    sTess.textContent  = String(wasm.get_tess_unique());
+    sZoom.textContent  = zoom.toFixed(1) + 'x';
 
     requestAnimationFrame(statsLoop);
   }

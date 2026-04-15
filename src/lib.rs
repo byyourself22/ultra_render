@@ -85,53 +85,50 @@ pub mod web {
         let anim_fps = crate::app::STAT_ANIM_FPS.load(Ordering::Relaxed) as f32 / 10.0;
         let anim_frame = crate::app::STAT_ANIM_FRAME.load(Ordering::Relaxed) as f32 / 10.0;
         let anim_total = crate::app::STAT_ANIM_FRAMES.load(Ordering::Relaxed) as f32 / 10.0;
-        let synced = crate::app::BATCH_SYNCED.load(Ordering::Relaxed);
         let subframes = crate::app::STAT_SUBFRAMES.load(Ordering::Relaxed) as f32 / 10.0;
         let unique_tess = crate::app::STAT_TESS_UNIQUE.load(Ordering::Relaxed);
         format!(
-            r#"{{"fps":{:.1},"draws":{},"sprites":{},"animFps":{:.0},"animFrame":{:.1},"animTotal":{:.0},"synced":{},"subframes":{:.1},"uniqueTess":{}}}"#,
-            fps, draws, sprites, anim_fps, anim_frame, anim_total, synced, subframes, unique_tess
+            r#"{{"fps":{:.1},"draws":{},"sprites":{},"animFps":{:.0},"animFrame":{:.1},"animTotal":{:.0},"subframes":{:.1},"uniqueTess":{}}}"#,
+            fps, draws, sprites, anim_fps, anim_frame, anim_total, subframes, unique_tess
         )
     }
 
     // ─── Sprite controls ────────────────────────────────────
 
-    /// Set target sprite count (clamped to 1–256).
+    /// Set target sprite count.
     #[wasm_bindgen]
     pub fn request_sprite_count(n: u32) {
-        let clamped = n.clamp(1, 256);
+        let clamped = n.clamp(1, 10000);
         crate::app::TARGET_SPRITES.store(clamped, Ordering::Relaxed);
     }
 
-    /// Set synced-batch mode.
-    /// When true, new sprites share the same animation frame → identical geometry → batchable.
-    /// When false, sprites are offset in time for visual variety.
+    /// Add N sprites (always synced — same frame, single draw call).
     #[wasm_bindgen]
-    pub fn set_batch_synced(synced: bool) {
-        crate::app::BATCH_SYNCED.store(synced, Ordering::Relaxed);
-    }
-
-    /// Whether sprites are currently in synced-batch mode.
-    #[wasm_bindgen]
-    pub fn get_batch_synced() -> bool {
-        crate::app::BATCH_SYNCED.load(Ordering::Relaxed)
-    }
-
-    /// Add N sprites in synced mode (same animation frame).
-    #[wasm_bindgen]
-    pub fn add_sprites_batched(n: u32) {
-        crate::app::BATCH_SYNCED.store(true, Ordering::Relaxed);
+    pub fn add_sprites(n: u32) {
         let current = crate::app::TARGET_SPRITES.load(Ordering::Relaxed);
-        let new_count = (current + n).clamp(1, 256);
+        let new_count = (current + n).clamp(1, 10000);
         crate::app::TARGET_SPRITES.store(new_count, Ordering::Relaxed);
     }
 
-    /// Add N sprites in unsynced mode (offset animation time).
+    // ─── Zoom / Pan ─────────────────────────────────────────
+
+    /// Set camera zoom level (1.0 = default, >1 = closer).
     #[wasm_bindgen]
-    pub fn add_sprites_unbatched(n: u32) {
-        crate::app::BATCH_SYNCED.store(false, Ordering::Relaxed);
-        let current = crate::app::TARGET_SPRITES.load(Ordering::Relaxed);
-        let new_count = (current + n).clamp(1, 256);
-        crate::app::TARGET_SPRITES.store(new_count, Ordering::Relaxed);
+    pub fn set_zoom(zoom: f32) {
+        let z = zoom.clamp(0.1, 20.0);
+        crate::app::ZOOM_LEVEL.store(z.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Set camera pan offset in world pixels.
+    #[wasm_bindgen]
+    pub fn set_pan(x: f32, y: f32) {
+        crate::app::PAN_X.store(x.to_bits(), Ordering::Relaxed);
+        crate::app::PAN_Y.store(y.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Get current zoom level.
+    #[wasm_bindgen]
+    pub fn get_zoom() -> f32 {
+        f32::from_bits(crate::app::ZOOM_LEVEL.load(Ordering::Relaxed))
     }
 }

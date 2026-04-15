@@ -180,11 +180,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = vec4<f32>(srgb_to_linear3(color.rgb), color.a);
     }
 
-    let stroke_edge_dist = min(in.uv.x, 1.0 - in.uv.x);
-    let stroke_aa_width = max(fwidth(in.uv.x), 1e-4) * 1.5;
-    let stroke_coverage = smoothstep(0.0, stroke_aa_width, stroke_edge_dist);
+    // Compute fwidth before any non-uniform branch (WGSL requirement).
+    // Clamp AA width so small sprites don't get over-softened.
+    let raw_fw = fwidth(in.uv.x);
+    let aa_width = clamp(raw_fw * 1.5, 1e-4, 0.25);
+
     if (in.uv.y > 0.5) {
-        color.a *= stroke_coverage;
+        // Stroke edge AA: uv.x encodes cross-stroke distance (0..1).
+        let stroke_edge_dist = min(in.uv.x, 1.0 - in.uv.x);
+        color.a *= smoothstep(0.0, aa_width, stroke_edge_dist);
+    } else {
+        // Fill edge AA: uv.x = 0 at boundary, 1 at midpoint.
+        // Only apply when derivative is reasonable (large sprites).
+        // At very small scales, MSAA alone handles AA adequately.
+        let fill_aa = select(1.0, smoothstep(0.0, aa_width, in.uv.x), raw_fw < 0.15);
+        color.a *= fill_aa;
     }
 
     // Premultiply alpha for correct blending
