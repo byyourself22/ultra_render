@@ -155,8 +155,11 @@ impl UltraCanvas {
     ///
     /// Rive-style optimization: for synced sprites, only collect draw commands from
     /// the first sprite — the rest share the same geometry via GPU instancing.
+    /// Collect draw groups. `zoom_transform` is applied to every sprite's
+    /// world transform (Rive-style: zoom = scale, not camera).
     pub fn collect_draw_groups(
         &mut self,
+        zoom_transform: &Mat2D,
     ) -> (
         Vec<(u32, Vec<crate::scene::layer::ShapeDrawCommand>)>,
         Vec<Mat2D>,
@@ -198,7 +201,7 @@ impl UltraCanvas {
 
         for &sprite_list_idx in &visible_indices {
             let sprite = &mut self.sprites[sprite_list_idx];
-            let world = sprite.world_transform();
+            let world = Mat2D::multiply(zoom_transform, &sprite.world_transform());
             let sprite_idx = transforms.len() as u32;
             transforms.push(world);
 

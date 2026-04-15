@@ -1,4 +1,4 @@
-use super::buffers::{ortho_projection_zoom, FrameUniforms, GpuBuffers};
+use super::buffers::{ortho_projection, FrameUniforms, GpuBuffers};
 use super::context::RenderContext;
 use super::pipeline;
 use crate::geometry::math::Mat2D;
@@ -110,9 +110,6 @@ impl RenderCanvas {
         geometry_stamp: u64,
         visible_sprite_count: u32,
         time: f32,
-        zoom: f32,
-        pan_x: f32,
-        pan_y: f32,
     ) -> Result<(), SurfaceError> {
         let surface = ctx.surface.as_ref().expect("No surface");
         let output = surface.get_current_texture()?;
@@ -122,13 +119,7 @@ impl RenderCanvas {
 
         // Frame uniforms
         let uniforms = FrameUniforms {
-            view_proj: ortho_projection_zoom(
-                ctx.width as f32,
-                ctx.height as f32,
-                zoom,
-                pan_x,
-                pan_y,
-            ),
+            view_proj: ortho_projection(ctx.width as f32, ctx.height as f32),
             resolution: [ctx.width as f32, ctx.height as f32],
             time,
             is_srgb: ctx.is_srgb as u32,

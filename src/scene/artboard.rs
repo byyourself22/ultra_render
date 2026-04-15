@@ -249,8 +249,8 @@ impl Artboard {
         let was_playing = self.player.advance(delta_seconds);
         let frame = self.player.frame;
 
-        // Only mark dirty if frame actually changed (use tiny epsilon for sub-frame precision)
-        if (frame - self.last_frame).abs() > f32::EPSILON {
+        // Only mark dirty if frame actually changed (filter sub-frame noise from f32 accumulation)
+        if (frame - self.last_frame).abs() > 0.001 {
             self.last_frame = frame;
             // Mark all nodes with transform dirt
             for node in &mut self.nodes {

@@ -556,7 +556,7 @@ fn tessellate_sprite_fills(
     u32,
 ) {
     let mut fill_vertices: Vec<GpuVertex> = Vec::new();
-    let mut fill_indices: Vec<u32> = Vec::new();
+    let fill_indices: Vec<u32> = Vec::new();
     let mut complex_fill_indices: Vec<u32> = Vec::new();
     let mut complex_fill_draws: Vec<ComplexFillDraw> = Vec::new();
     let mut ordered_draws: Vec<EncodedDraw> = Vec::new();
@@ -741,7 +741,7 @@ fn encode_complex_fill(
         // triangles to paint beyond the cover quad.
         bounds.expand_to_include(contour.midpoint);
 
-        let Some((first_vertex, total_edge_verts, midpoint_idx)) = append_fill_contour_geometry(
+        let Some((first_vertex, total_edge_verts, _midpoint_idx)) = append_fill_contour_geometry(
             contour,
             color,
             paint_index,

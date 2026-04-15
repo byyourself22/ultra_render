@@ -1,9 +1,118 @@
-/// Cubic bezier easing interpolation (ThorVG tvgLottieInterpolator style)
+/// Cubic bezier easing interpolation (matches ThorVG's LottieInterpolator)
 ///
 /// Given control points (x1,y1) and (x2,y2) in [0,1], computes the eased
 /// value for a linear progress t in [0,1].
+///
+/// Uses a pre-computed sampling table for initial guess, then refines with
+/// Newton-Raphson (when slope is steep enough) or binary subdivision (when
+/// slope is too shallow for Newton to converge reliably).
 
-/// Evaluate a cubic bezier easing curve.
+const SPLINE_TABLE_SIZE: usize = 11;
+const SAMPLE_STEP_SIZE: f32 = 1.0 / (SPLINE_TABLE_SIZE as f32 - 1.0);
+const NEWTON_MIN_SLOPE: f32 = 0.02;
+const NEWTON_ITERATIONS: u32 = 4;
+const SUBDIVISION_PRECISION: f32 = 0.0000001;
+const SUBDIVISION_MAX_ITERATIONS: u32 = 10;
+
+#[inline]
+fn const_a(a1: f32, a2: f32) -> f32 {
+    1.0 - 3.0 * a2 + 3.0 * a1
+}
+
+#[inline]
+fn const_b(a1: f32, a2: f32) -> f32 {
+    3.0 * a2 - 6.0 * a1
+}
+
+#[inline]
+fn const_c(a1: f32) -> f32 {
+    3.0 * a1
+}
+
+/// Evaluate cubic bezier component using Horner form (ThorVG _calcBezier)
+#[inline]
+fn calc_bezier(t: f32, a1: f32, a2: f32) -> f32 {
+    ((const_a(a1, a2) * t + const_b(a1, a2)) * t + const_c(a1)) * t
+}
+
+/// Derivative of cubic bezier component (ThorVG _getSlope)
+#[inline]
+fn get_slope(t: f32, a1: f32, a2: f32) -> f32 {
+    3.0 * const_a(a1, a2) * t * t + 2.0 * const_b(a1, a2) * t + const_c(a1)
+}
+
+/// Build the sample table for x-component (11 evenly spaced samples)
+fn build_samples(x1: f32, x2: f32) -> [f32; SPLINE_TABLE_SIZE] {
+    let mut samples = [0.0f32; SPLINE_TABLE_SIZE];
+    for i in 0..SPLINE_TABLE_SIZE {
+        samples[i] = calc_bezier(i as f32 * SAMPLE_STEP_SIZE, x1, x2);
+    }
+    samples
+}
+
+/// Newton-Raphson refinement (ThorVG NewtonRaphsonIterate)
+fn newton_raphson(target_x: f32, guess: f32, x1: f32, x2: f32) -> f32 {
+    let mut t = guess;
+    for _ in 0..NEWTON_ITERATIONS {
+        let current_x = calc_bezier(t, x1, x2) - target_x;
+        let slope = get_slope(t, x1, x2);
+        if slope == 0.0 {
+            return t;
+        }
+        t -= current_x / slope;
+    }
+    t
+}
+
+/// Binary subdivision fallback (ThorVG binarySubdivide)
+fn binary_subdivide(target_x: f32, mut lo: f32, mut hi: f32, x1: f32, x2: f32) -> f32 {
+    let mut t;
+    let mut i = 0u32;
+    loop {
+        t = lo + (hi - lo) / 2.0;
+        let x = calc_bezier(t, x1, x2) - target_x;
+        if x > 0.0 {
+            hi = t;
+        } else {
+            lo = t;
+        }
+        i += 1;
+        if x.abs() <= SUBDIVISION_PRECISION || i >= SUBDIVISION_MAX_ITERATIONS {
+            break;
+        }
+    }
+    t
+}
+
+/// Find t for a given x using sample table + Newton/bisection (ThorVG getTForX)
+fn get_t_for_x(target_x: f32, samples: &[f32; SPLINE_TABLE_SIZE], x1: f32, x2: f32) -> f32 {
+    // Find interval where t lies
+    let mut interval_start = 0.0f32;
+    let mut current = 1;
+    let last = SPLINE_TABLE_SIZE - 1;
+
+    while current < last && samples[current] <= target_x {
+        interval_start += SAMPLE_STEP_SIZE;
+        current += 1;
+    }
+    current -= 1;
+
+    // Interpolate to provide an initial guess for t
+    let dist = (target_x - samples[current]) / (samples[current + 1] - samples[current]);
+    let guess = interval_start + dist * SAMPLE_STEP_SIZE;
+
+    // Check slope to decide strategy
+    let initial_slope = get_slope(guess, x1, x2);
+    if initial_slope >= NEWTON_MIN_SLOPE {
+        newton_raphson(target_x, guess, x1, x2)
+    } else if initial_slope == 0.0 {
+        guess
+    } else {
+        binary_subdivide(target_x, interval_start, interval_start + SAMPLE_STEP_SIZE, x1, x2)
+    }
+}
+
+/// Evaluate a cubic bezier easing curve (matches ThorVG LottieInterpolator::progress).
 /// Control points: (0,0) -> (x1,y1) -> (x2,y2) -> (1,1)
 /// Input `t` is the time ratio [0,1], returns eased ratio [0,1].
 pub fn cubic_bezier_ease(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
@@ -14,77 +123,14 @@ pub fn cubic_bezier_ease(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
         return 1.0;
     }
 
-    // Linear case
-    if (x1 - y1).abs() < 1e-6 && (x2 - y2).abs() < 1e-6 {
+    // Linear case (matches ThorVG: outTangent.x == outTangent.y && inTangent.x == inTangent.y)
+    if x1 == y1 && x2 == y2 {
         return t;
     }
 
-    // Newton's method to find the parameter s such that bezier_x(s) = t
-    let s = find_t_for_x(x1, x2, t);
-
-    // Evaluate y at s
-    bezier_component(y1, y2, s)
-}
-
-/// Evaluate one component of a cubic bezier: (0) -> (c1) -> (c2) -> (1)
-fn bezier_component(c1: f32, c2: f32, t: f32) -> f32 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let mt = 1.0 - t;
-    let mt2 = mt * mt;
-    // B(t) = 3*mt^2*t*c1 + 3*mt*t^2*c2 + t^3
-    3.0 * mt2 * t * c1 + 3.0 * mt * t2 * c2 + t3
-}
-
-/// Derivative of bezier_component
-fn bezier_component_deriv(c1: f32, c2: f32, t: f32) -> f32 {
-    let mt = 1.0 - t;
-    // B'(t) = 3*mt^2*c1 + 6*mt*t*(c2-c1) + 3*t^2*(1-c2)
-    3.0 * mt * mt * c1 + 6.0 * mt * t * (c2 - c1) + 3.0 * t * t * (1.0 - c2)
-}
-
-/// Newton-Raphson + bisection fallback to find s where bezier_x(s) = target_x
-fn find_t_for_x(x1: f32, x2: f32, target_x: f32) -> f32 {
-    // Initial guess
-    let mut s = target_x;
-
-    // Newton's method (8 iterations)
-    for _ in 0..8 {
-        let x = bezier_component(x1, x2, s) - target_x;
-        let dx = bezier_component_deriv(x1, x2, s);
-        if dx.abs() < 1e-10 {
-            break;
-        }
-        let new_s = s - x / dx;
-        if (new_s - s).abs() < 1e-7 {
-            return new_s.clamp(0.0, 1.0);
-        }
-        s = new_s;
-    }
-
-    // Bisection fallback if Newton didn't converge well
-    let s_clamped = s.clamp(0.0, 1.0);
-    let residual = (bezier_component(x1, x2, s_clamped) - target_x).abs();
-    if residual < 1e-5 {
-        return s_clamped;
-    }
-
-    let mut lo = 0.0f32;
-    let mut hi = 1.0f32;
-    s = target_x;
-    for _ in 0..20 {
-        let x = bezier_component(x1, x2, s);
-        if (x - target_x).abs() < 1e-7 {
-            return s;
-        }
-        if x < target_x {
-            lo = s;
-        } else {
-            hi = s;
-        }
-        s = (lo + hi) * 0.5;
-    }
-    s
+    let samples = build_samples(x1, x2);
+    let s = get_t_for_x(t, &samples, x1, x2);
+    calc_bezier(s, y1, y2)
 }
 
 /// Interpolation mode for a keyframe segment

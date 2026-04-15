@@ -333,6 +333,114 @@ impl AABB {
     }
 }
 
+// ─── Rive-style Fit / Alignment ─────────────────────────────
+
+/// How the artboard content fits into the frame (Rive API).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Fit {
+    /// Scale to fill the frame; content may be clipped.
+    Cover = 0,
+    /// Scale to fit entirely inside the frame; letterbox if needed.
+    Contain = 1,
+    /// Stretch to fill the frame exactly (may distort).
+    Fill = 2,
+    /// Scale down only if larger; otherwise show at 1:1.
+    ScaleDown = 3,
+    /// No scaling — show content at original size.
+    None = 4,
+}
+
+impl Fit {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Fit::Cover,
+            1 => Fit::Contain,
+            2 => Fit::Fill,
+            3 => Fit::ScaleDown,
+            4 => Fit::None,
+            _ => Fit::Contain,
+        }
+    }
+}
+
+/// Alignment within the frame (Rive API).
+#[derive(Clone, Copy, Debug)]
+pub struct Alignment {
+    pub x: f32, // -1 = left,  0 = center, +1 = right
+    pub y: f32, // -1 = top,   0 = center, +1 = bottom
+}
+
+impl Alignment {
+    pub const CENTER: Self = Self { x: 0.0, y: 0.0 };
+    pub const TOP_LEFT: Self = Self { x: -1.0, y: -1.0 };
+    pub const TOP_CENTER: Self = Self { x: 0.0, y: -1.0 };
+    pub const TOP_RIGHT: Self = Self { x: 1.0, y: -1.0 };
+    pub const CENTER_LEFT: Self = Self { x: -1.0, y: 0.0 };
+    pub const CENTER_RIGHT: Self = Self { x: 1.0, y: 0.0 };
+    pub const BOTTOM_LEFT: Self = Self { x: -1.0, y: 1.0 };
+    pub const BOTTOM_CENTER: Self = Self { x: 0.0, y: 1.0 };
+    pub const BOTTOM_RIGHT: Self = Self { x: 1.0, y: 1.0 };
+}
+
+/// Compute the alignment transform that maps `content` AABB into `frame` AABB
+/// using the given Fit and Alignment, scaled by `scale_factor` (DPI).
+///
+/// This is the Rive `computeAlignment` equivalent.
+///
+/// Returns a Mat2D: local content coords → frame (screen) coords.
+pub fn compute_alignment(
+    fit: Fit,
+    alignment: Alignment,
+    frame: &AABB,
+    content: &AABB,
+    scale_factor: f32,
+) -> Mat2D {
+    let content_w = content.width();
+    let content_h = content.height();
+    if content_w < 1e-6 || content_h < 1e-6 {
+        return Mat2D::identity();
+    }
+
+    let frame_w = frame.width() / scale_factor;
+    let frame_h = frame.height() / scale_factor;
+
+    let (sx, sy) = match fit {
+        Fit::Cover => {
+            let s = (frame_w / content_w).max(frame_h / content_h);
+            (s, s)
+        }
+        Fit::Contain => {
+            let s = (frame_w / content_w).min(frame_h / content_h);
+            (s, s)
+        }
+        Fit::Fill => (frame_w / content_w, frame_h / content_h),
+        Fit::ScaleDown => {
+            let s = (frame_w / content_w).min(frame_h / content_h).min(1.0);
+            (s, s)
+        }
+        Fit::None => (1.0, 1.0),
+    };
+
+    let scaled_w = content_w * sx;
+    let scaled_h = content_h * sy;
+    let tx = frame.min_x / scale_factor + (frame_w - scaled_w) * 0.5 * (1.0 + alignment.x)
+        - content.min_x * sx;
+    let ty = frame.min_y / scale_factor + (frame_h - scaled_h) * 0.5 * (1.0 + alignment.y)
+        - content.min_y * sy;
+
+    Mat2D {
+        values: [
+            sx * scale_factor,
+            0.0,
+            0.0,
+            sy * scale_factor,
+            tx * scale_factor,
+            ty * scale_factor,
+        ],
+    }
+}
+
 /// Cubic bezier utilities (Rive-style)
 pub fn cubic_tangents(p0: Vec2D, p1: Vec2D, p2: Vec2D, p3: Vec2D) -> (Vec2D, Vec2D) {
     let mut tan0 = p1 - p0;

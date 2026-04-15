@@ -1,7 +1,8 @@
-// UltraRender Web Entry Point
+// UltraRender Web Entry Point — Rive-style API
 
 interface WasmModule {
   default: () => Promise<void>;
+  // Stats
   get_fps: () => number;
   get_draw_calls: () => number;
   get_sprite_count: () => number;
@@ -10,14 +11,21 @@ interface WasmModule {
   get_anim_total_frames: () => number;
   get_subframes: () => number;
   get_tess_unique: () => number;
+  // Sprites
   request_sprite_count: (n: number) => void;
   add_sprites: (n: number) => void;
-  set_zoom: (zoom: number) => void;
-  set_pan: (x: number, y: number) => void;
-  get_zoom: () => number;
+  // Playback
   play: () => void;
   pause: () => void;
   is_paused: () => boolean;
+  set_speed: (speed: number) => void;
+  get_speed: () => number;
+  // View
+  set_zoom: (zoom: number) => void;
+  set_pan: (x: number, y: number) => void;
+  get_zoom: () => number;
+  set_fit: (fit: number) => void;
+  set_scale_factor: (dpr: number) => void;
 }
 
 async function main() {
@@ -33,12 +41,15 @@ async function main() {
   const cCount   = document.getElementById('c-count')!;
   const noWebGPU = document.getElementById('no-webgpu')!;
 
+  let wasm: WasmModule | null = null;
+
   // Sync canvas pixel dimensions before WASM loads
   const canvas = document.getElementById('ultra-canvas') as HTMLCanvasElement;
   const syncSize = () => {
     const dpr = window.devicePixelRatio || 1;
     canvas.width  = Math.round(window.innerWidth * dpr);
     canvas.height = Math.round(window.innerHeight * dpr);
+    wasm?.set_scale_factor(dpr);
   };
   syncSize();
   window.addEventListener('resize', syncSize);
@@ -50,14 +61,14 @@ async function main() {
   }
 
   sStatus.textContent = 'Initializing WebGPU...';
-
-  let wasm: WasmModule | null = null;
   let target = 1;
 
   try {
     // @ts-ignore
     wasm = await import('../../pkg/ultra_render.js') as WasmModule;
     await wasm.default();
+    // Set initial DPI scale factor
+    wasm.set_scale_factor(window.devicePixelRatio || 1);
     sStatus.textContent = 'Running';
   } catch (e) {
     console.error('UltraRender init failed:', e);
@@ -79,17 +90,7 @@ async function main() {
   document.getElementById('b-1k')!.addEventListener('click', () => setTarget(target + 1000));
   document.getElementById('b-reset')!.addEventListener('click', () => setTarget(1));
 
-  // Keyboard shortcuts
-  window.addEventListener('keydown', (e) => {
-    if (e.key === '=' || e.key === '+') setTarget(target + 1);
-    if (e.key === '-') setTarget(target - 1);
-    if (e.key === '1') setTarget(1);
-    if (e.key === '0') setTarget(target + 100);
-    if (e.key === 'r' || e.key === 'R') resetView();
-    if (e.key === ' ') { e.preventDefault(); togglePlayPause(); }
-  });
-
-  // -- Zoom / Pan --
+  // -- Zoom / Pan (Rive-style: zoom = scale transform on sprites) --
   let zoom = 1.0;
   let panX = 0.0;
   let panY = 0.0;
@@ -160,10 +161,8 @@ async function main() {
     }
   });
 
-  // Double-click to reset view
   canvas.addEventListener('dblclick', resetView);
 
-  // View control buttons
   document.getElementById('b-zoom-in')!.addEventListener('click', () => {
     zoomBy(1.3, canvas.width / 2, canvas.height / 2);
   });
@@ -183,6 +182,32 @@ async function main() {
   }
 
   bPlayPause.addEventListener('click', togglePlayPause);
+
+  // -- Speed --
+  let playbackSpeed = 1.0;
+  const sSpeed = document.getElementById('s-speed');
+
+  function setSpeed(s: number) {
+    playbackSpeed = Math.max(0, Math.min(10, s));
+    wasm?.set_speed(playbackSpeed);
+    if (sSpeed) sSpeed.textContent = playbackSpeed.toFixed(1) + 'x';
+  }
+
+  document.getElementById('b-speed-down')?.addEventListener('click', () => setSpeed(playbackSpeed - 0.25));
+  document.getElementById('b-speed-up')?.addEventListener('click', () => setSpeed(playbackSpeed + 0.25));
+  document.getElementById('b-speed-reset')?.addEventListener('click', () => setSpeed(1.0));
+
+  // -- Keyboard shortcuts --
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '=' || e.key === '+') setTarget(target + 1);
+    if (e.key === '-') setTarget(target - 1);
+    if (e.key === '1') setTarget(1);
+    if (e.key === '0') setTarget(target + 100);
+    if (e.key === 'r' || e.key === 'R') resetView();
+    if (e.key === ' ') { e.preventDefault(); togglePlayPause(); }
+    if (e.key === '[') setSpeed(playbackSpeed - 0.25);
+    if (e.key === ']') setSpeed(playbackSpeed + 0.25);
+  });
 
   // -- Stats loop --
   function statsLoop() {

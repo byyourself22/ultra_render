@@ -8,7 +8,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::engine::UltraCanvas;
-use crate::geometry::math::Vec2D;
+use crate::geometry::math::{compute_alignment, Alignment, Fit, Vec2D, AABB};
 use crate::renderer::canvas::RenderCanvas;
 use crate::renderer::context::RenderContext;
 
@@ -30,8 +30,11 @@ pub static ZOOM_LEVEL: AtomicU32 = AtomicU32::new(0x3F800000); // 1.0f32.to_bits
 pub static PAN_X: AtomicU32 = AtomicU32::new(0); // 0.0f32.to_bits()
 pub static PAN_Y: AtomicU32 = AtomicU32::new(0); // 0.0f32.to_bits()
 
-// Playback control: 0 = playing, 1 = paused
-pub static PLAYBACK_PAUSED: AtomicU32 = AtomicU32::new(0);
+// Playback control
+pub static PLAYBACK_PAUSED: AtomicU32 = AtomicU32::new(0); // 0 = playing, 1 = paused
+pub static PLAYBACK_SPEED: AtomicU32 = AtomicU32::new(0x3F800000); // 1.0f32 = normal speed
+pub static FIT_MODE: AtomicU32 = AtomicU32::new(1); // Fit::Contain = 1
+pub static SCALE_FACTOR: AtomicU32 = AtomicU32::new(0x3F800000); // 1.0f32 = no DPI scaling
 
 /// Rolling window size for stable FPS measurement.
 /// 120 frames ≈ ~0.8s at 144 Hz — large enough to eliminate sub-frame
@@ -146,14 +149,19 @@ impl App {
                     STAT_ANIM_FPS.store((fr * 10.0) as u32, Ordering::Relaxed);
                     STAT_ANIM_FRAMES.store(((op - ip) * 10.0) as u32, Ordering::Relaxed);
 
-                    let comp_w = sprite.composition_width;
-                    let comp_h = sprite.composition_height;
-                    let scale = (width / comp_w).min(height / comp_h) * 0.8;
-                    sprite.scale = Vec2D::new(scale, scale);
-                    sprite.position = Vec2D::new(
-                        (width - comp_w * scale) * 0.5,
-                        (height - comp_h * scale) * 0.5,
+                    // Rive-style: compute alignment transform (Contain + Center)
+                    let dpr = f32::from_bits(SCALE_FACTOR.load(Ordering::Relaxed)).max(1.0);
+                    let fit = Fit::from_u32(FIT_MODE.load(Ordering::Relaxed));
+                    let frame = AABB::new(0.0, 0.0, width, height);
+                    let content = AABB::new(
+                        0.0,
+                        0.0,
+                        sprite.composition_width,
+                        sprite.composition_height,
                     );
+                    let xform = compute_alignment(fit, Alignment::CENTER, &frame, &content, dpr);
+                    sprite.scale = Vec2D::new(xform.values[0], xform.values[3]);
+                    sprite.position = Vec2D::new(xform.values[4], xform.values[5]);
                 }
                 log::info!("Loaded animation successfully");
             }
@@ -221,6 +229,8 @@ impl App {
         }
         let w = canvas.viewport_width;
         let h = canvas.viewport_height;
+        let dpr = f32::from_bits(SCALE_FACTOR.load(Ordering::Relaxed)).max(1.0);
+        let fit = Fit::from_u32(FIT_MODE.load(Ordering::Relaxed));
         let cols = (count as f32).sqrt().ceil() as usize;
         let rows = (count + cols - 1) / cols;
         let cell_w = w / cols as f32;
@@ -229,13 +239,22 @@ impl App {
         for (i, sprite) in canvas.sprites.iter_mut().enumerate() {
             let row = i / cols;
             let col = i % cols;
-            let scale =
-                (cell_w / sprite.composition_width).min(cell_h / sprite.composition_height) * 0.8;
-            sprite.position = Vec2D::new(
-                col as f32 * cell_w + (cell_w - sprite.composition_width * scale) * 0.5,
-                row as f32 * cell_h + (cell_h - sprite.composition_height * scale) * 0.5,
+            // Rive-style: compute_alignment for each cell
+            let frame = AABB::new(
+                col as f32 * cell_w,
+                row as f32 * cell_h,
+                (col + 1) as f32 * cell_w,
+                (row + 1) as f32 * cell_h,
             );
-            sprite.scale = Vec2D::new(scale, scale);
+            let content = AABB::new(
+                0.0,
+                0.0,
+                sprite.composition_width,
+                sprite.composition_height,
+            );
+            let xform = compute_alignment(fit, Alignment::CENTER, &frame, &content, dpr);
+            sprite.scale = Vec2D::new(xform.values[0], xform.values[3]);
+            sprite.position = Vec2D::new(xform.values[4], xform.values[5]);
         }
     }
 
@@ -521,9 +540,10 @@ impl ApplicationHandler for App {
                 // flicker/blank frames.
 
                 let paused = PLAYBACK_PAUSED.load(Ordering::Relaxed) != 0;
+                let speed = f32::from_bits(PLAYBACK_SPEED.load(Ordering::Relaxed)).clamp(0.0, 10.0);
                 if let Some(canvas) = &mut self.ultra_canvas {
                     if !paused {
-                        canvas.update(dt);
+                        canvas.update(dt * speed);
                     }
                 }
 
@@ -545,10 +565,34 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Build zoom transform (Rive-style: zoom = scale on sprites).
+                // Zoom scales around viewport center, pan offsets.
+                use crate::geometry::math::Mat2D;
+                let vw = self
+                    .ultra_canvas
+                    .as_ref()
+                    .map(|c| c.viewport_width)
+                    .unwrap_or(1.0);
+                let vh = self
+                    .ultra_canvas
+                    .as_ref()
+                    .map(|c| c.viewport_height)
+                    .unwrap_or(1.0);
+                let zoom_xform = {
+                    // T(center) * S(zoom) * T(-center) * T(-pan)
+                    let cx = vw * 0.5;
+                    let cy = vh * 0.5;
+                    let tx = cx * (1.0 - zoom) - pan_x * zoom;
+                    let ty = cy * (1.0 - zoom) - pan_y * zoom;
+                    Mat2D {
+                        values: [zoom, 0.0, 0.0, zoom, tx, ty],
+                    }
+                };
+
                 // Collect LOCAL-space draws grouped by sprite + per-sprite transforms.
                 let (sprite_groups, transforms, batch_synced, geometry_stamp) =
                     if let Some(uc) = &mut self.ultra_canvas {
-                        uc.collect_draw_groups()
+                        uc.collect_draw_groups(&zoom_xform)
                     } else {
                         (Vec::new(), Vec::new(), false, 0)
                     };
@@ -575,9 +619,6 @@ impl ApplicationHandler for App {
                         geometry_stamp,
                         transforms.len() as u32,
                         time,
-                        zoom,
-                        pan_x,
-                        pan_y,
                     ) {
                         Ok(_) => {
                             gpu_draw_calls = rc.gpu_draw_call_count();

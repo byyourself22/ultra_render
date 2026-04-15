@@ -490,28 +490,6 @@ pub fn ortho_projection(width: f32, height: f32) -> [f32; 16] {
     ]
 }
 
-/// Orthographic projection with zoom and pan.
-///
-/// `zoom`: scale factor (>1 = closer). `pan_x`/`pan_y`: camera offset in world pixels.
-///
-/// Camera center in world space = (w/2 + pan_x, h/2 + pan_y).
-/// Visible area = w/zoom × h/zoom pixels centered on that point.
-pub fn ortho_projection_zoom(
-    width: f32,
-    height: f32,
-    zoom: f32,
-    pan_x: f32,
-    pan_y: f32,
-) -> [f32; 16] {
-    let sx = zoom * 2.0 / width;
-    let sy = -zoom * 2.0 / height;
-    let tx = -zoom * (1.0 + 2.0 * pan_x / width);
-    let ty = zoom * (1.0 + 2.0 * pan_y / height);
-    [
-        sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, tx, ty, 0.0, 1.0,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

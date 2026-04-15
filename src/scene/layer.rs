@@ -400,8 +400,8 @@ pub fn bezier_to_raw_path(bezier: &BezierPath) -> RawPath {
         let cp2x = bezier.vertices[i].x + it.x;
         let cp2y = bezier.vertices[i].y + it.y;
 
-        // If tangents are zero, use line_to
-        if ot.x.abs() < 1e-4 && ot.y.abs() < 1e-4 && it.x.abs() < 1e-4 && it.y.abs() < 1e-4 {
+        // If tangents are effectively zero, use line_to
+        if ot.x.abs() < 1e-6 && ot.y.abs() < 1e-6 && it.x.abs() < 1e-6 && it.y.abs() < 1e-6 {
             path.line_to(bezier.vertices[i].x, bezier.vertices[i].y);
         } else {
             path.cubic_to(
@@ -434,7 +434,7 @@ pub fn bezier_to_raw_path(bezier: &BezierPath) -> RawPath {
         let cp2x = bezier.vertices[0].x + it.x;
         let cp2y = bezier.vertices[0].y + it.y;
 
-        if ot.x.abs() < 1e-4 && ot.y.abs() < 1e-4 && it.x.abs() < 1e-4 && it.y.abs() < 1e-4 {
+        if ot.x.abs() < 1e-6 && ot.y.abs() < 1e-6 && it.x.abs() < 1e-6 && it.y.abs() < 1e-6 {
             // No tangents, just close
         } else {
             path.cubic_to(
