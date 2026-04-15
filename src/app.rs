@@ -30,6 +30,9 @@ pub static ZOOM_LEVEL: AtomicU32 = AtomicU32::new(0x3F800000); // 1.0f32.to_bits
 pub static PAN_X: AtomicU32 = AtomicU32::new(0); // 0.0f32.to_bits()
 pub static PAN_Y: AtomicU32 = AtomicU32::new(0); // 0.0f32.to_bits()
 
+// Playback control: 0 = playing, 1 = paused
+pub static PLAYBACK_PAUSED: AtomicU32 = AtomicU32::new(0);
+
 /// Rolling window size for stable FPS measurement.
 /// 120 frames ≈ ~0.8s at 144 Hz — large enough to eliminate sub-frame
 /// oscillation, small enough to react to real performance changes.
@@ -511,20 +514,17 @@ impl ApplicationHandler for App {
                 let pan_x = f32::from_bits(PAN_X.load(Ordering::Relaxed));
                 let pan_y = f32::from_bits(PAN_Y.load(Ordering::Relaxed));
 
-                // Update view bounds for zoom/pan-aware visibility culling
-                if let Some(canvas) = &mut self.ultra_canvas {
-                    let w = canvas.viewport_width;
-                    let h = canvas.viewport_height;
-                    let cx = w * 0.5 + pan_x;
-                    let cy = h * 0.5 + pan_y;
-                    let hvw = w / (2.0 * zoom);
-                    let hvh = h / (2.0 * zoom);
-                    canvas.view_bounds =
-                        crate::geometry::math::AABB::new(cx - hvw, cy - hvh, cx + hvw, cy + hvh);
-                }
+                // view_bounds stays at (0,0,w,h) — NOT adjusted for zoom/pan.
+                // The GPU projection matrix handles zoom clipping.  Adjusting
+                // view_bounds during zoom changes the visible sprite set, which
+                // changes geometry_stamp, which forces re-tessellation and causes
+                // flicker/blank frames.
 
+                let paused = PLAYBACK_PAUSED.load(Ordering::Relaxed) != 0;
                 if let Some(canvas) = &mut self.ultra_canvas {
-                    canvas.update(dt);
+                    if !paused {
+                        canvas.update(dt);
+                    }
                 }
 
                 // Publish current animation frame + subframe stats.
@@ -539,7 +539,7 @@ impl ApplicationHandler for App {
                     let anim_fps = STAT_ANIM_FPS.load(Ordering::Relaxed) as f32 / 10.0;
                     if anim_fps > 0.1 {
                         let subframes = self.smoothed_fps / anim_fps;
-                        STAT_SUBFRAMES.store((subframes * 10.0) as u32, Ordering::Relaxed);
+                        STAT_SUBFRAMES.store((subframes * 10.0).round() as u32, Ordering::Relaxed);
                     } else {
                         STAT_SUBFRAMES.store(0, Ordering::Relaxed);
                     }

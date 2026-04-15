@@ -588,35 +588,14 @@ fn tessellate_sprite_fills(
             continue;
         }
 
-        let fill_index_start = fill_indices.len() as u32;
         let complex_draw_start = complex_fill_draws.len();
-        let same_winding = contours_have_uniform_winding(&contour_data);
 
-        // NonZero + uniform winding: ALWAYS use simple midpoint fan.
-        // Overlapping fan triangles all share the same winding direction,
-        // so NonZero fill produces correct results even for concave shapes.
-        // This matches ThorVG's approach and eliminates render-path oscillation
-        // that causes visual trembling on animated concave shapes (e.g. chin).
-        if fill_rule == crate::geometry::path::FillRule::NonZero && same_winding {
-            encode_fill_midpoint_fans(
-                &contour_data,
-                color,
-                paint_index,
-                sprite_idx,
-                &mut fill_vertices,
-                &mut fill_indices,
-                &mut fill_contours,
-                &mut fill_cubics,
-            );
-            let index_count = fill_indices.len() as u32 - fill_index_start;
-            if index_count > 0 {
-                ordered_draws.push(EncodedDraw::Simple {
-                    source: SimpleDrawSource::Fill,
-                    index_start: fill_index_start,
-                    index_count,
-                });
-            }
-        } else {
+        // ALL fills go through the stencil pipeline (stencil + cover)
+        // for 1:1 fidelity. The stencil accumulates winding correctly for
+        // any shape complexity — convex, concave, self-intersecting.
+        // The cover pass reads stencil ≠ 0, writes color, and zeros the
+        // stencil, preventing contamination between fills.
+        {
             encode_complex_fill(
                 &contour_data,
                 color,
@@ -700,7 +679,6 @@ struct ContourFillData {
     samples: Vec<Vec2D>,
     midpoint: Vec2D,
     signed_area: f32,
-    fan_safe: bool,
 }
 
 const FILL_TOPOLOGY_NONE: u32 = 0;
@@ -726,68 +704,16 @@ fn collect_fill_contours(contours: &[Contour]) -> Vec<ContourFillData> {
         }
 
         let midpoint = contour_midpoint(contour);
-        let fan_safe = point_in_polygon(&samples, midpoint)
-            && point_in_polygon_kernel_approx(&samples, midpoint);
 
         result.push(ContourFillData {
             contour: contour.clone(),
             samples,
             midpoint,
             signed_area,
-            fan_safe,
         });
     }
 
     result
-}
-
-fn contours_have_uniform_winding(contours: &[ContourFillData]) -> bool {
-    let mut winding_sign = 0.0f32;
-    for contour in contours {
-        let sign = contour.signed_area.signum();
-        if winding_sign == 0.0 {
-            winding_sign = sign;
-        } else if sign != winding_sign {
-            return false;
-        }
-    }
-    true
-}
-
-fn encode_fill_midpoint_fans(
-    contours: &[ContourFillData],
-    color: Color,
-    paint_index: u32,
-    sprite_index: u32,
-    fill_vertices: &mut Vec<GpuVertex>,
-    fill_indices: &mut Vec<u32>,
-    fill_contours: &mut Vec<GpuFillContour>,
-    fill_cubics: &mut Vec<GpuFillCubic>,
-) {
-    for contour in contours {
-        let Some((_, total_edge_verts, _)) = append_fill_contour_geometry(
-            contour,
-            color,
-            paint_index,
-            sprite_index,
-            fill_vertices,
-            fill_contours,
-            fill_cubics,
-        ) else {
-            continue;
-        };
-
-        if total_edge_verts < 3 {
-            continue;
-        }
-
-        let first_index = fill_indices.len() as u32;
-        fill_indices.resize(fill_indices.len() + total_edge_verts as usize * 3, 0);
-        if let Some(fill_contour) = fill_contours.last_mut() {
-            fill_contour.first_index = first_index;
-            fill_contour.simple_fill = FILL_TOPOLOGY_SIMPLE;
-        }
-    }
 }
 
 fn encode_complex_fill(
@@ -810,6 +736,10 @@ fn encode_complex_fill(
         for p in &contour.samples {
             bounds.expand_to_include(*p);
         }
+        // Include the midpoint in bounds — for concave shapes, the fan center
+        // can be outside the convex hull of edge samples, causing stencil
+        // triangles to paint beyond the cover quad.
+        bounds.expand_to_include(contour.midpoint);
 
         let Some((first_vertex, total_edge_verts, midpoint_idx)) = append_fill_contour_geometry(
             contour,
@@ -847,12 +777,15 @@ fn encode_complex_fill(
         return;
     }
 
+    // Pad the cover quad by 1 local-space unit to account for
+    // GPU/CPU float precision differences in cubic evaluation.
+    let pad = 1.0;
     let cover_vertex_start = fill_vertices.len() as u32;
     let cover_verts = [
-        [bounds.min_x, bounds.min_y],
-        [bounds.max_x, bounds.min_y],
-        [bounds.max_x, bounds.max_y],
-        [bounds.min_x, bounds.max_y],
+        [bounds.min_x - pad, bounds.min_y - pad],
+        [bounds.max_x + pad, bounds.min_y - pad],
+        [bounds.max_x + pad, bounds.max_y + pad],
+        [bounds.min_x - pad, bounds.max_y + pad],
     ];
     for pos in cover_verts {
         fill_vertices.push(GpuVertex {

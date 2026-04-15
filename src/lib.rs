@@ -131,4 +131,24 @@ pub mod web {
     pub fn get_zoom() -> f32 {
         f32::from_bits(crate::app::ZOOM_LEVEL.load(Ordering::Relaxed))
     }
+
+    // ─── Playback ───────────────────────────────────────────
+
+    /// Play (resume) the animation.
+    #[wasm_bindgen]
+    pub fn play() {
+        crate::app::PLAYBACK_PAUSED.store(0, Ordering::Relaxed);
+    }
+
+    /// Pause the animation.
+    #[wasm_bindgen]
+    pub fn pause() {
+        crate::app::PLAYBACK_PAUSED.store(1, Ordering::Relaxed);
+    }
+
+    /// Check if currently paused.
+    #[wasm_bindgen]
+    pub fn is_paused() -> bool {
+        crate::app::PLAYBACK_PAUSED.load(Ordering::Relaxed) != 0
+    }
 }

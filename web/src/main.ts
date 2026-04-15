@@ -15,6 +15,9 @@ interface WasmModule {
   set_zoom: (zoom: number) => void;
   set_pan: (x: number, y: number) => void;
   get_zoom: () => number;
+  play: () => void;
+  pause: () => void;
+  is_paused: () => boolean;
 }
 
 async function main() {
@@ -83,6 +86,7 @@ async function main() {
     if (e.key === '1') setTarget(1);
     if (e.key === '0') setTarget(target + 100);
     if (e.key === 'r' || e.key === 'R') resetView();
+    if (e.key === ' ') { e.preventDefault(); togglePlayPause(); }
   });
 
   // -- Zoom / Pan --
@@ -167,6 +171,18 @@ async function main() {
     zoomBy(1 / 1.3, canvas.width / 2, canvas.height / 2);
   });
   document.getElementById('b-view-reset')!.addEventListener('click', resetView);
+
+  // -- Playback --
+  const bPlayPause = document.getElementById('b-play-pause')!;
+  let paused = false;
+
+  function togglePlayPause() {
+    paused = !paused;
+    if (paused) { wasm?.pause(); } else { wasm?.play(); }
+    bPlayPause.textContent = paused ? 'Play' : 'Pause';
+  }
+
+  bPlayPause.addEventListener('click', togglePlayPause);
 
   // -- Stats loop --
   function statsLoop() {
