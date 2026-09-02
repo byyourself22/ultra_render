@@ -1,295 +1,147 @@
-# UltraRender - High-Performance Lottie WebGPU Renderer in Rust
+# UltraRender
 
-## Objetivo
+High-performance **Lottie renderer** written in Rust and powered by **WebGPU**.
 
-Renderizador de animacoes Lottie/JSON em Rust usando WebGPU, com arquitetura inspirada no **Rive Runtime** (GPU pipeline, draw batching, tessellation) e no **ThorVG** (parsing Lottie, scene tree, efeitos visuais). Canvas unica para multiplos sprites, 100+ FPS, state machine.
+UltraRender is designed for rendering many animated Lottie/JSON objects efficiently on a single GPU canvas, with a lightweight architecture focused on games, interactive interfaces and real-time applications.
 
----
+## Goals
 
-## Arquitetura (baseada em Rive + ThorVG)
+* Rust + WebGPU
+* Lottie / JSON animation support
+* Single canvas for multiple sprites
+* GPU draw batching
+* GPU-friendly tessellation
+* Scene tree
+* Visual effects
+* State machines
+* Native + WebAssembly targets
+* High sprite count
+* 100+ FPS target
 
-### 1. Lottie Parser (inspirado em ThorVG `tvgLottieParser/tvgLottieModel`)
+## Architecture
 
-**O que usaremos do ThorVG:**
-- Modelo de dados Lottie: `LottieObject` hierarquia (Composition > Layer > Group > Shape)
-- Tipos de objetos: `SolidFill`, `SolidStroke`, `GradientFill`, `GradientStroke`, `Rect`, `Ellipse`, `Path`, `Polystar`, `Trimpath`, `Repeater`, `RoundedCorner`, `OffsetPath`, `PuckerBloat`
-- Efeitos: `DropShadow`, `GaussianBlur`, `Tint`, `Tritone`, `Fill`, `Stroke`
-- Mascaras: `LottieMask` com metodos (Add, Subtract, Intersect, Difference)
-- Propriedades animaveis: `LottieFloat`, `LottieColor`, `LottieVector`, `LottieOpacity`, `LottiePathSet`
-- Interpoladores (easing): cubic bezier, hold, linear (tvgLottieInterpolator)
-- Texto: `LottieTextRange`, `LottieGlyph`, `TextDocument`
+UltraRender takes inspiration from two mature rendering architectures:
 
-**Nosso modulo `lottie/`:**
-```
-lottie/
-  mod.rs          - re-exports
-  parser.rs       - JSON parsing (serde_json)
-  model.rs        - LottieComposition, Layer, Shape, etc.
-  property.rs     - Animated properties with keyframes
-  interpolator.rs - Easing/bezier interpolation
-  effects.rs      - DropShadow, GaussianBlur, Tint, etc.
-  modifiers.rs    - TrimPath, RoundedCorner, OffsetPath, PuckerBloat, Repeater
-```
+**skia Runtime**
 
-### 2. Scene Graph / Animation Engine
+* GPU rendering pipeline
+* Draw batching
+* Tessellation
+* Efficient animation runtime
 
-**O que usaremos do Rive:**
-- Artboard como container principal de uma animacao
-- StateMachine para controle de estados, transicoes, inputs
-- LinearAnimation com keyframes
-- Play/Stop/Pause controle por sprite
+**ThorVG**
 
-**O que usaremos do ThorVG:**
-- Arvore de layers com pre-composicoes
-- Blend modes por layer (Normal, Multiply, Screen, Add, etc.)
-- Matte/Track matte (Alpha, Luma, etc.)
-- Transform hierarchy (position, anchor, scale, rotation, opacity)
+* Lottie parsing
+* Scene tree
+* Shapes and paths
+* Masks and clipping
+* Visual effects
 
-**Nosso modulo `scene/`:**
-```
-scene/
-  mod.rs          - re-exports
-  composition.rs  - Root composition container
-  layer.rs        - Layer types (Shape, Precomp, Solid, Image, Null, Text)
-  transform.rs    - Animated transforms (Mat2D, position, scale, rotation, anchor)
-  animation.rs    - Animation playback, time, frame management
-  state_machine.rs - State machine com inputs, transicoes, estados
-  sprite.rs       - Sprite instance (posicao na canvas, animacao, state)
-```
-
-### 3. Geometry Pipeline (inspirado em Rive `renderer/`)
-
-**O que usaremos do Rive:**
-- Tessellation de cubicas via shaders (Wang's formula para contagem de segmentos)
-- Merge de segmentos parametricos + polares para curvas suaves
-- De Casteljau para avaliacao de pontos em cubicas
-- Contour/Path buffer architecture (pathBuffer, contourBuffer)
-- Stroke expansion com caps (Round, Butt, Square) e joins (Round, Miter, Bevel)
-- Fill rules: EvenOdd e NonZero (Winding)
-- Interior triangulation para preenchimento
-- "Retrofitted triangles" para otimizacao de geometria simples
-- Feather (anti-aliasing suave em bordas)
-
-**O que usaremos do ThorVG:**
-- Conversao de shapes Lottie em paths (Rect, Ellipse, Polystar -> bezier paths)
-- PathSet com pts/cmds (MoveTo, LineTo, CubicTo, Close)
-
-**Nosso modulo `geometry/`:**
-```
-geometry/
-  mod.rs          - re-exports
-  path.rs         - RawPath com commands (move, line, cubic, close)
-  tessellation.rs - GPU tessellation de cubicas (Wang's formula)
-  stroke.rs       - Stroke expansion, caps, joins
-  fill.rs         - Fill triangulation (even-odd, winding)
-  shapes.rs       - Lottie shapes -> bezier paths
-  math.rs         - Vec2D, Mat2D, AABB, bezier utilities
+```text
+Lottie JSON
+    │
+    ▼
+  Parser
+    │
+    ▼
+Scene Tree
+    │
+    ▼
+Animation Runtime
+    │
+    ▼
+Tessellation
+    │
+    ▼
+Draw Batcher
+    │
+    ▼
+WebGPU Renderer
+    │
+    ▼
+   Canvas
 ```
 
-### 4. GPU Renderer (inspirado em Rive PLS/WebGPU)
+## Example
 
-**O que usaremos do Rive:**
-- Draw batching: agrupar draws similares para reduzir draw calls
-- Draw types: `PathDraw`, `ImageRectDraw`, `ImageMeshDraw`
-- Render pipeline: beginFrame -> draws -> flush
-- Tessellation texture: resultados de tessellacao armazenados em textura
-- Gradient library: ramp de cores em textura
-- Clip system: clipID + clip rects com inverse matrix
-- Blend modes via shader
-- Coverage/stencil para fills complexos
-- Uniforms: FlushUniforms, PathData, ContourData
+```rust
+let mut renderer = UltraRenderer::new(&device, &queue);
 
-**Shaders WGSL que precisaremos:**
-1. `tessellate.wgsl` - Tessellation de cubicas Bezier na GPU
-2. `draw_path.wgsl` - Vertex/Fragment shader para paths (fill + stroke)
-3. `gradient.wgsl` - Gradient ramp generation
-4. `blend.wgsl` - Advanced blend modes
-5. `blur.wgsl` - Gaussian blur (efeito)
-6. `shadow.wgsl` - Drop shadow (efeito)
-7. `blit.wgsl` - Blit/composite final
+let animation = renderer.load("character.json")?;
 
-**Nosso modulo `renderer/`:**
-```
-renderer/
-  mod.rs           - re-exports, Renderer trait
-  context.rs       - RenderContext (GPU resources, frame management)
-  canvas.rs        - Canvas unica para multiplos sprites
-  draw.rs          - Draw commands, batching
-  pipeline.rs      - WebGPU render pipelines
-  buffers.rs       - GPU buffers (vertex, index, uniform, storage)
-  textures.rs      - Texture management (tessellation, gradients, atlas)
-  shaders/
-    tessellate.wgsl
-    draw_path.wgsl
-    gradient.wgsl
-    blend.wgsl
-    effects.wgsl
-    blit.wgsl
+let sprite = renderer.spawn(animation);
+
+sprite.set_position(320.0, 180.0);
+sprite.play("idle");
+
+renderer.render();
 ```
 
-### 5. Canvas / Sprite Engine
+## State Machine
 
-**Inspirado em Rive Artboard + ThorVG Canvas:**
-- Canvas unica renderiza N sprites simultaneamente
-- Cada sprite tem: posicao, escala, rotacao, animacao, estado
-- Frustum culling por sprite (nao renderiza sprites fora da view)
-- Z-ordering para sobreposicao correta
-- Batch rendering: sprites com mesma animacao compartilham recursos
-
-```
-engine/
-  mod.rs           - re-exports
-  canvas.rs        - UltraCanvas com multi-sprite support
-  sprite.rs        - Sprite instances com transform + animation state
-  batch.rs         - Sprite batching por animacao/material
-  culling.rs       - View frustum culling
+```rust
+sprite.set_bool("running", true);
+sprite.set_number("speed", 2.0);
+sprite.fire("attack");
 ```
 
----
+State machines are evaluated by the runtime while rendering remains fully GPU-oriented.
 
-## Dependencias Rust
+## Performance
 
-```toml
-[dependencies]
-wgpu = "24"            # WebGPU abstraction
-winit = "0.30"          # Windowing
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"        # Lottie JSON parsing
-bytemuck = { version = "1", features = ["derive"] }
-glam = "0.29"           # Math (Vec2, Mat2, Mat4)
-pollster = "0.4"        # Async runtime for wgpu
-log = "0.4"
-env_logger = "0.11"
-zip = "2"               # .lottie files (ZIP format)
-lyon = "1"              # CPU tessellation fallback
-image = "0.25"          # Image loading for assets
-flate2 = "1"            # Decompression
+UltraRender is designed around a shared rendering context instead of creating an isolated renderer for every animation.
+
+```text
+1 WebGPU Device
+1 Canvas
+1 Render Pipeline
+
+        │
+        ├── Sprite
+        ├── Sprite
+        ├── Sprite
+        ├── Sprite
+        └── ...
 ```
 
----
+Animations are grouped and submitted through batched GPU draw calls whenever possible.
 
-## Pipeline de Rendering (por frame)
+The target is smooth rendering of large numbers of animated objects at **100+ FPS**, depending on animation complexity and hardware.
 
-```
-1. UPDATE PHASE
-   - Advance animation time
-   - Evaluate keyframes + interpolation
-   - Update transforms (hierarchy)
-   - Apply modifiers (trim, round corners, etc.)
-   - Apply effects (blur, shadow)
-   - Resolve shapes -> paths
+## Targets
 
-2. GEOMETRY PHASE
-   - Convert paths to GPU-ready geometry
-   - Tessellate curves (Wang's formula)
-   - Generate stroke geometry
-   - Triangulate fills
-   - Upload to GPU buffers
+```text
+Native
+├── Windows
+├── Linux
+└── macOS
 
-3. DRAW PHASE (batched)
-   - Sort draws by z-order, blend mode, texture
-   - Batch compatible draws
-   - Set uniforms (transforms, colors, gradients)
-   - Execute draw calls:
-     a. Gradient ramp generation
-     b. Path fills (stencil + cover or direct)
-     c. Path strokes
-     d. Image draws
-     e. Effects (blur, shadow as post-process)
-     f. Blend/composite
-
-4. PRESENT
-   - Final composite to swapchain
+Web
+└── WebAssembly + WebGPU
 ```
 
----
+## Status
 
-## Features Completas
+🚧 **Experimental**
 
-### Shapes (do ThorVG LottieObject types)
-- [x] Rectangle (com rounded corners)
-- [x] Ellipse
-- [x] Path (bezier paths arbitrarios)
-- [x] Polystar (star/polygon)
-- [x] Group (container)
+UltraRender is currently under active development.
 
-### Paint
-- [x] Solid Fill (color + opacity)
-- [x] Solid Stroke (color + width + opacity)
-- [x] Gradient Fill (linear + radial)
-- [x] Gradient Stroke
-- [x] Blend modes (Normal, Multiply, Screen, Overlay, Add, etc.)
+Planned areas include:
 
-### Modifiers
-- [x] Trim Path (start, end, offset)
-- [x] Rounded Corners
-- [x] Offset Path
-- [x] Pucker & Bloat
-- [x] Repeater
+* Lottie parser
+* Shapes and paths
+* Gradients
+* Masks
+* Clipping
+* Trim paths
+* Blend modes
+* Text
+* Images
+* Effects
+* Draw batching
+* State machines
+* WASM bindings
 
-### Efeitos
-- [x] Gaussian Blur
-- [x] Drop Shadow (color, angle, distance, blur)
-- [x] Tint
-- [x] Tritone
-- [x] Fill effect
-- [x] Stroke effect
+## License
 
-### Animacao
-- [x] Keyframes com easing (cubic bezier, linear, hold)
-- [x] Multi-dimensional keyframes (position, scale)
-- [x] Time remapping
-- [x] Pre-compositions
-- [x] Masks (add, subtract, intersect, difference)
-- [x] Mattes (alpha, luma)
-- [x] Expressions (basic)
-
-### Engine
-- [x] Multi-sprite canvas
-- [x] Play / Stop / Pause / Seek
-- [x] State Machine (inputs, transitions)
-- [x] 100+ FPS target
-- [x] Draw batching (Rive-style)
-- [x] GPU tessellation (Rive-style)
-
----
-
-## Estrutura de Arquivos Final
-
-```
-ultra_render/
-  Cargo.toml
-  src/
-    main.rs              - Entry point, window, event loop
-    lib.rs               - Public API
-    lottie/              - Lottie format parsing
-    scene/               - Scene graph, animation, state machine
-    geometry/            - Paths, tessellation, stroke, fill
-    renderer/            - WebGPU GPU renderer
-      shaders/           - WGSL shaders
-    engine/              - Canvas, sprites, batching
-  animations/            - Test animation files
-    json/
-    lottie/
-```
-
----
-
-## O que NAO usaremos
-
-- **Rive .riv format** - Apenas Lottie/JSON
-- **Rive C++ runtime** - Reimplementamos em Rust
-- **ThorVG C++ renderer** - Usamos apenas como referencia para parsing
-- **ThorVG SVG loader** - Fora de escopo
-- **Rive text layout engine** - Simplificado para Lottie text
-- **Rive audio** - Fora de escopo
-
----
-
-## Como Rodar
-
-```bash
-cargo build
-cargo run -- animations/json/gfunny.json
-cargo test
-```
+TBD
